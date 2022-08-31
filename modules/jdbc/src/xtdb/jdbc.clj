@@ -146,7 +146,18 @@
           :document-cache document-cache
           :document-store (->JdbcDocumentStore pool dialect))))
 
-(defrecord JdbcTxLog [pool dialect ^Closeable tx-consumer]
+(defn fetch-txs [pool dialect after-offset fetch-size]
+  ;; see https://github.com/xtdb/xtdb/issues/1682#issuecomment-1232945875
+  (let [sql "SELECT EVENT_OFFSET, TX_TIME, V, TOPIC FROM tx_events WHERE EVENT_OFFSET > ? AND EVENT_OFFSET <= ? ORDER BY EVENT_OFFSET"]
+    (with-open [conn (jdbc/get-connection pool)
+                stmt (jdbc/prepare conn [sql after-offset (+ after-offset fetch-size)])
+                rs (.executeQuery stmt)]
+      (let [rows (vec (resultset-seq rs))
+            last-offset (some-> rows peek :event_offset long)]
+        {:txs (into [] (keep #(when (= "txs" (:topic %)) (row->log-entry % dialect))) rows)
+         :last-offset last-offset}))))
+
+(defrecord JdbcTxLog [pool dialect fetch-size ^Closeable tx-consumer]
   db/TxLog
   (submit-tx [this tx-events] (db/submit-tx this tx-events {}))
 
@@ -161,14 +172,13 @@
                             (::xt/tx-time tx-data))}))))
 
   (open-tx-log [_ after-tx-id]
-    (let [conn (jdbc/get-connection pool)
-          stmt (jdbc/prepare conn
-                             ["SELECT EVENT_OFFSET, TX_TIME, V, TOPIC FROM tx_events WHERE TOPIC = 'txs' and EVENT_OFFSET > ? ORDER BY EVENT_OFFSET"
-                              (or after-tx-id 0)])
-          rs (.executeQuery stmt)]
-      (xio/->cursor #(run! xio/try-close [rs stmt conn])
-                    (->> (resultset-seq rs)
-                         (map #(row->log-entry % dialect))))))
+    (letfn [(tx-seq [watermark]
+              (lazy-seq
+                (let [{:keys [txs, last-offset]} (fetch-txs pool dialect watermark fetch-size)]
+                  (if last-offset
+                    (concat txs (tx-seq last-offset))
+                    (seq txs)))))]
+      (xio/->cursor (constantly nil) (tx-seq (or after-tx-id 0)))))
 
   (subscribe [this after-tx-id f]
     (tx-sub/handle-polling-subscription this after-tx-id {:poll-sleep-duration (Duration/ofMillis 100)} f))
@@ -183,6 +193,8 @@
   (close [_]
     (xio/try-close tx-consumer)))
 
-(defn ->tx-log {::sys/deps {:connection-pool `->connection-pool}}
-  [{{:keys [pool dialect]} :connection-pool}]
-  (map->JdbcTxLog {:pool pool, :dialect dialect}))
+(defn ->tx-log {::sys/args {:fetch-size {:default 1024, :spec ::sys/pos-int}}
+                ::sys/deps {:connection-pool `->connection-pool}}
+  [{:keys [connection-pool, fetch-size]}]
+  (let [{:keys [pool, dialect]} connection-pool]
+    (map->JdbcTxLog {:pool pool, :dialect dialect, :fetch-size fetch-size})))

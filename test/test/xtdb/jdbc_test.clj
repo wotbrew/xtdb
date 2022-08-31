@@ -157,3 +157,29 @@
       (let [db (xt/db *api*)]
         (t/is (= {:xt/id :foo} (xt/entity db :foo)))
         (t/is (= {:xt/id :bar} (xt/entity db :bar)))))))
+
+(t/deftest tx-log-is-streamed-test
+  (when-not (#{:sqlite} fj/*db-type*)
+
+    (dotimes [n 10000] (xt/submit-tx *api* [[::xt/put {:xt/id n ::n n}]]))
+
+    (xt/sync *api*)
+
+    (t/is (= 20000 (::xt/tx-id (xt/latest-submitted-tx *api*))))
+
+    (let [fetch-results (atom [])
+          fetch-events j/fetch-txs
+          fetch-size (-> #'j/->tx-log meta :xtdb.system/args :fetch-size :default)
+          current-thread (Thread/currentThread)]
+      (t/is (pos-int? fetch-size))
+      (with-redefs [j/fetch-txs (fn [& args]
+                                  (let [ret (apply fetch-events args)]
+                                    (when (= (Thread/currentThread) current-thread)
+                                      (swap! fetch-results conj ret))
+                                    ret))]
+        (with-open [tx-log-iterator (xt/open-tx-log *api* 0 false)]
+          (let [entry-seq (iterator-seq tx-log-iterator)]
+            (t/is (= 10000 (count entry-seq)))
+            ;; +1 because (remaining rows), and the fetch sequencing right now can submit a final fetch before terminating.
+            (t/is (<= 1 (count @fetch-results) (+ 2 (quot 20000 fetch-size))))
+            (t/is (every? #(<= (count %) (long (Math/ceil (/ fetch-size 2)))) @fetch-results))))))))
