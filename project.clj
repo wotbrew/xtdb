@@ -86,7 +86,8 @@
    [pro.juxt.clojars-mirrors.com.taoensso/nippy "3.1.1-2"]
    [ring/ring-devel "1.9.5"]
    [software.amazon.awssdk/cloudwatch "2.17.241"]
-   [software.amazon.awssdk/s3 "2.17.241"]]
+   [software.amazon.awssdk/s3 "2.17.241"]
+   [com.github.ben-manes.caffeine/caffeine "2.9.3"]]
 
   :dependencies
   [[org.clojure/clojure]

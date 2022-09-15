@@ -21,6 +21,7 @@
                  [org.clojure/tools.reader]
                  [org.clojure/data.json]
                  [org.clojure/tools.cli]
+                 [com.github.ben-manes.caffeine/caffeine]
                  [org.agrona/agrona "1.16.0"]
                  [com.github.jnr/jnr-ffi "2.2.12" :scope "provided"]
                  [pro.juxt.clojars-mirrors.edn-query-language/eql "2021.02.28"]]

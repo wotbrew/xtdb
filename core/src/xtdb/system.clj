@@ -258,6 +258,7 @@
          int?))
 
 (s/def ::nat-int (s/and ::int nat-int?))
+(s/def ::nat-int32 (s/and ::int nat-int? ::below-max-signed-max #(<= % Integer/MAX_VALUE)))
 (s/def ::pos-int (s/and ::int pos-int?))
 
 (s/def ::double
