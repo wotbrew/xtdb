@@ -1,108 +1,203 @@
-(ns dev.auction-mark
+(ns auction-mark
   (:require [xtdb.api :as xt]
-            [clojure.string :as str]))
+            [clojure.string :as str])
+  (:import (java.time Instant Clock)
+           (java.util Random)
+           (java.util.concurrent.atomic AtomicLong)
+           (java.util.concurrent ConcurrentHashMap)
+           (java.util.function Function)))
 
-(defn current-timestamp [worker])
+(defrecord Worker [node rng domain-state clock])
 
-(defn submit-tx [worker tx])
+(defn current-timestamp ^Instant [worker]
+  (.instant ^Clock (:clock worker)))
 
-(defn domain
-  "Defines some value domain (e.g for an attribute / type) that is used in transactions or loading."
-  [& opts])
+(defn counter ^AtomicLong [worker domain]
+  (.computeIfAbsent ^ConcurrentHashMap (:domain-state worker) domain (reify Function (apply [_ _] (AtomicLong.)))))
 
-(defn increment [worker domain & args])
-(defn pick-gaussian [worker domain & args])
-(defn pick-rand [worker domain & args])
+(defn rng ^Random [worker] (:rng worker))
 
-(def xt-auto-id (domain))
-(def user-id (domain))
-(def region-id (domain))
-(def user-attribute (domain))
-(def item-id (domain))
-(def user-id (domain))
-(def category-id (domain))
-(def global-attribute-group-id (domain))
-(def global-attribute-value-id (domain))
-(def item-name (domain))
-(def item-description (domain))
-(def initial-price (domain))
-(def reserve-price (domain))
-(def buy-now (domain))
-(def item-attributes-blob (domain))
-(def item-image-path (domain))
-(def auction-start-date (domain))
-(def auction-end-date (domain))
+(defn worker [node] (->Worker node (Random.) (ConcurrentHashMap.) (Clock/systemUTC)))
 
+(defn id
+  "Defines some function of a continuous integer domain, literally just identity, but with uh... identity, e.g
+   the function returned is a different closure every time."
+  []
+  (fn [n] n))
 
+(defn increment [worker domain] (domain (.getAndIncrement (counter worker domain))))
 
-(defn tx-new-user [worker]
-  (->> [[::xt/put {:xt/id (increment worker xt-auto-id)
-                   :u_id (increment worker user-id)
-                   :u_r_id (pick-gaussian worker region-id)
-                   :u_rating 0
-                   :u_balance 0.0
-                   :u_created (current-timestamp worker)
-                   :u_sattr0 (pick-rand worker user-attribute)
-                   :u_sattr1 (pick-rand worker user-attribute)
-                   :u_sattr2 (pick-rand worker user-attribute)
-                   :u_sattr3 (pick-rand worker user-attribute)
-                   :u_sattr4 (pick-rand worker user-attribute)
-                   :u_sattr5 (pick-rand worker user-attribute)
-                   :u_sattr6 (pick-rand worker user-attribute)
-                   :u_sattr7 (pick-rand worker user-attribute)}]]
-       (submit-tx worker)))
+(defn- nat-or-nil [n] (when (nat-int? n) n))
 
-(defn pick-histogram
-  "Selects an id using the given pre-built weighting histogram."
-  [worker domain])
+(defn sample-gaussian [worker domain]
+  (let [random (rng worker)
+        long-counter (counter worker domain)]
+    (some-> (min (dec (.get long-counter)) (Math/round (* (.get long-counter) (* 0.5 (+ 1.0 (.nextGaussian random))))))
+            long
+            nat-or-nil
+            domain)))
 
-(defn pick-many [opts f & args])
+(defn sample-flat [worker domain]
+  (let [random (rng worker)
+        long-counter (counter worker domain)]
+    (some-> (min (dec (.get long-counter)) (Math/round (* (.get long-counter) (.nextDouble random))))
+            long
+            nat-or-nil
+            domain)))
 
-(defn q [worker q & args])
+(defn sample-histogram
+  "Selects a value from the domain using the given pre-built weighting histogram."
+  [worker domain histogram]
+  ;; todo use hist
+  (sample-gaussian worker domain))
 
-(defn tx-new-item [worker]
-  (let [i_id (increment worker item-id)
-        u_id (pick-gaussian worker user-id)
-        c_id (pick-histogram worker category-id)
-        name (pick-rand worker item-name)
-        description (pick-rand worker item-description)
-        initial-price (pick-rand worker initial-price)
-        reserve-price (pick-rand worker reserve-price)
-        buy-now (pick-rand worker buy-now)
-        attributes (pick-rand worker item-attributes-blob)
-        gag-ids (pick-many {:min 0, :max 16, :unique true} pick-rand global-attribute-group-id)
-        gav-ids (pick-many {:min 0, :max 16, :unique true} pick-rand global-attribute-value-id)
-        images (pick-many {:min 0, :max 16, :unique true} pick-rand item-image-path)
-        start-date (pick-rand worker auction-start-date)
-        end-date (pick-rand worker auction-end-date {:min auction-start-date})
+(defn random-seq [worker opts f & args]
+  (let [{:keys [min, max, unique]} opts]
+    (->> (repeatedly #(apply f worker args))
+         (take (+ min (.nextInt (rng worker) (- max min))))
+         ((if unique distinct identity)))))
 
+(defn random-str [worker] (str (.nextInt (rng worker))))
+
+(defn random-price [worker] 3.14)
+
+(def user-id (partial str "u_"))
+(def region-id (partial str "r_"))
+(def item-id (partial str "i_"))
+(def category-id (partial str "c_"))
+(def global-attribute-group-id (partial str "gag_"))
+(def global-attribute-value-id (partial str "gav_"))
+
+(def user-attribute (id))
+(def item-name (id))
+(def item-description (id))
+(def initial-price (id))
+(def reserve-price (id))
+(def buy-now (id))
+(def item-attributes-blob (id))
+(def item-image-path (id))
+(def auction-start-date (id))
+
+(defn proc-new-user
+  "Creates a new USER record. The rating and balance are both set to zero.
+
+  The benchmark randomly selects id from a pool of region ids as an input for u_r_id parameter using flat distribution."
+  [worker]
+  (let [u_id (increment worker user-id)]
+    (->> [[::xt/put {:xt/id u_id
+                     :u_id u_id
+                     :u_r_id (sample-flat worker region-id)
+                     :u_rating 0
+                     :u_balance 0.0
+                     :u_created (current-timestamp worker)
+                     :u_sattr0 (random-str worker)
+                     :u_sattr1 (random-str worker)
+                     :u_sattr2 (random-str worker)
+                     :u_sattr3 (random-str worker)
+                     :u_sattr4 (random-str worker)
+                     :u_sattr5 (random-str worker)
+                     :u_sattr6 (random-str worker)
+                     :u_sattr7 (random-str worker)}]]
+         (xt/submit-tx (:node worker)))))
+
+(def category-id-histogram nil)
+
+(def tx-fn-apply-seller-fee
+  '(fn [ctx u_id]
+     (let [db (xtdb.api/db ctx)
+           u (xt/entity db u_id)]
+       (if u
+         [[::xt/put (update u :u_balance dec)]]
+         []))))
+
+(def tx-fn-new-bids
+  '(fn [ctx i_id]
+     (let [db (xt/db ctx)
+           [i nbids]
+           (first
+             (xt/q db '[:find ?i, ?nbids
+                        :in [?iid]
+                        :where
+                        [?i :i_id ?iid]
+                        [?i :i_num_bids ?nbids]
+                        [?i :i_status 0]] i_id))]
+       ;; increment number of bids
+       (when i
+         [[::xt/put {:xt/id i, :i_num_bids (inc nbids)}]])
+
+       )))
+
+(defn proc-new-item
+  "Insert a new ITEM record for a user.
+
+  The benchmark client provides all the preliminary information required for the new item, as well as optional information to create derivative image and attribute records.
+  After inserting the new ITEM record, the transaction then inserts any GLOBAL ATTRIBUTE VALUE and ITEM IMAGE.
+
+  After these records are inserted, the transaction then updates the USER record to add the listing fee to the seller’s balance.
+
+  The benchmark randomly selects id from a pool of users as an input for u_id parameter using Gaussian distribution. A c_id parameter is randomly selected using a flat histogram from the real auction site’s item category statistic."
+  [worker]
+  (let [i_id-raw (.getAndIncrement (counter worker item-id))
+        i_id (item-id i_id-raw)
+        u_id (sample-gaussian worker user-id)
+        c_id (sample-histogram worker category-id category-id-histogram)
+        name (random-str worker)
+        description (random-str worker)
+        initial-price (random-price worker)
+        attributes (random-str worker)
+        gag-ids (remove nil? (random-seq worker {:min 0, :max 16, :unique true} sample-flat global-attribute-group-id))
+        gav-ids (remove nil? (random-seq worker {:min 0, :max 16, :unique true} sample-flat global-attribute-value-id))
+        images (random-seq worker {:min 0, :max 16, :unique true} random-str)
+        start-date (current-timestamp worker)
+        ;; up to 42 days
+        end-date (.plusSeconds ^Instant start-date (* 60 60 24 (* (inc (.nextInt (rng worker) 42)))))
         ;; append attribute names to desc
         description-with-attributes
-        (->> '[:find ?gag-name ?gav-name
-               ;; todo check this param syntax
-               :in [[?gag-id] [?gav-id]]
-               :where
-               [?gav-gag-id :gav_gag_id ?gag-id]
-               [?gag-id :gag_name ?gag-name]
-               [?gav-id :gav_name ?gav-name]]
-             (q worker {:params [gag-ids gav-ids]})
-             (str/join " ")
-             (str description " "))
-
-        ]
+        (let [q '[:find ?gag-name ?gav-name
+                  ;; todo check this param syntax
+                  :in [?gag-id ...] [?gav-id ...]
+                  :where
+                  [?gav-gag-id :gav_gag_id ?gag-id]
+                  [?gag-id :gag_name ?gag-name]
+                  [?gav-id :gav_name ?gav-name]]]
+          (->> (xt/q (xt/db (:node worker)) q gag-ids gav-ids)
+               (str/join " ")
+               (str description " ")))]
 
     (->> (concat
-           ;; todo fill
-           [[::xt/put {}]]
+           [[::xt/put {:xt/id i_id
+                       :i_id i_id
+                       :i_u_id u_id
+                       :i_c_id c_id
+                       :i_name name
+                       :i_description description-with-attributes
+                       :i_user_attributes attributes
+                       :i_initial_price initial-price
+                       :i_num_bids 0
+                       :i_num_images (count images)
+                       :i_num_global_attrs (count gav-ids)
+                       :i_start_date start-date
+                       :i_end_date end-date
+                       ;; open
+                       :i_status 0}]]
            ;; todo fill
            (for [[i image] (map-indexed vector images)
-                 :let [ii_id (bit-or (bit-shift-left i 60) (bit-and i_id 0x0FFFFFFFFFFFFFFF))]]
-             [::xt/put {}])
+                 :let [ii_id (bit-or (bit-shift-left i 60) (bit-and i_id-raw 0x0FFFFFFFFFFFFFFF))]]
+             [::xt/put {:xt/id (str "ii_" ii_id)
+                        :ii_id ii_id
+                        :ii_i_id i_id
+                        :ii_u_id u_id
+                        :ii_path image}])
            ;; reg tx fn?
-           [[:xt/fn :apply-seller-fee u_id]])
-         (submit-tx worker))
+           [[::xt/fn :apply-seller-fee u_id]])
+         (xt/submit-tx (:node worker)))))
 
-    ))
+(defn proc-new-bid!
+  [worker])
+
+(defn setup [node]
+  (xt/submit-tx node [[::xt/put {:xt/id :apply-seller-fee
+                                 :xt/fn tx-fn-apply-seller-fee}]]))
 
 (def auction-mark
   "A model of the auction-mark benchmark
