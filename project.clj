@@ -136,7 +136,9 @@
    [criterium "0.4.6"]
 
    ;; xtdb-core test dep
-   [clj-commons/fs "1.6.310"]]
+   [clj-commons/fs "1.6.310"]
+
+   [org.hdrhistogram/HdrHistogram "2.1.12"]]
 
   :source-paths ["dev"]
 
