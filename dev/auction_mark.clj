@@ -3,14 +3,14 @@
             [clojure.string :as str]
             [clojure.java.io :as io]
             [clojure.tools.logging :as log])
-  (:import (java.time Instant Clock)
-           (java.util Random PriorityQueue Comparator Deque)
+  (:import (java.time Instant Clock Duration)
+           (java.util Random Comparator)
            (java.util.concurrent.atomic AtomicLong)
            (java.util.concurrent ConcurrentHashMap)
            (java.util.function Function)
            (com.google.common.collect MinMaxPriorityQueue)))
 
-(defrecord Worker [node rng domain-state clock])
+(defrecord Worker [node random domain-state custom-state clock])
 
 (defn current-timestamp ^Instant [worker]
   (.instant ^Clock (:clock worker)))
@@ -18,9 +18,7 @@
 (defn counter ^AtomicLong [worker domain]
   (.computeIfAbsent ^ConcurrentHashMap (:domain-state worker) domain (reify Function (apply [_ _] (AtomicLong.)))))
 
-(defn rng ^Random [worker] (:rng worker))
-
-(defn worker [node] (->Worker node (Random.) (ConcurrentHashMap.) (Clock/systemUTC)))
+(defn rng ^Random [worker] (:random worker))
 
 (defn id
   "Defines some function of a continuous integer domain, literally just identity, but with uh... identity, e.g
@@ -48,7 +46,7 @@
             nat-or-nil
             domain)))
 
-(defn weighting
+(defn weighted-sample-fn
   "Aliased random sampler:
 
   https://www.peterstefek.me/alias-method.html
@@ -163,7 +161,7 @@
        )))
 
 (defn- sample-category-id [worker]
-  (if-some [weighting (::category-weighting worker)]
+  (if-some [weighting (::category-weighting (:custom-state worker))]
     (weighting (rng worker))
     (sample-gaussian worker category-id)))
 
@@ -267,10 +265,11 @@
          (into {}))))
 
 (defn- load-categories-tsv [worker]
-  (let [cats (read-category-tsv)]
+  (let [cats (read-category-tsv)
+        {:keys [^ConcurrentHashMap custom-state]} worker]
     ;; squirrel these data-structures away for later (see category-generator, sample-category-id)
-    (assoc worker ::categories cats
-                  ::category-weighting (weighting (map (juxt :id :item-count) (vals cats))))))
+    (.putAll custom-state {::categories cats
+                           ::category-weighting (weighted-sample-fn (map (juxt :id :item-count) (vals cats)))})))
 
 (defn generate-region [worker]
   (let [r-id (increment worker category-id)]
@@ -279,7 +278,7 @@
      :r_name (random-str worker 6 32)}))
 
 (defn generate-category [worker]
-  (let [{::keys [categories]} worker
+  (let [{::keys [categories]} (:custom-state worker)
         c-id (increment worker category-id)
         {:keys [category-name, parent]} (categories c-id)]
     {:xt/id c-id
@@ -295,199 +294,165 @@
 
    :fns {:apply-seller-fee #'tx-fn-apply-seller-fee}
 
-   :workers
-   [[:proc #'proc-new-user]
-    [:proc #'proc-new-item]]})
+   :tasks
+   [[:proc #'proc-new-user {}]
+    [:proc #'proc-new-item {:weight 2}]]})
 
-(defn setup [benchmark]
+(defn setup [node benchmark]
   (let [{:keys [loaders, fns]} benchmark
-        node (xt/start-node {})
-        domain-state (ConcurrentHashMap.)
         clock (Clock/systemUTC)
         seed 0
         random (Random. seed)
-        worker (->Worker node random domain-state clock)]
+        domain-state (ConcurrentHashMap.)
+        custom-state (ConcurrentHashMap.)
+        worker
+        (map->Worker
+          {:node node,
+           :random random,
+           :domain-state domain-state
+           :custom-state custom-state
+           :clock clock})]
+
+    (log/info "Inserting transaction functions")
+    (->> (for [[id fvar] fns]
+           ;; todo wrap with histo trace
+           [::xt/put {:xt/id id, :xt/fn @fvar}])
+         (xt/submit-tx node))
+
+    (log/info "Loading data")
+    (let [run-loader
+          (fn [[t & args]]
+            (case t
+              :f (apply (first args) worker (rest args))
+              :generator
+              (let [[f opts] args
+                    {:keys [n] :or {n 0}} opts
+                    doc-seq (repeatedly n (partial f worker))
+                    partition-count 512]
+                (doseq [chunk (partition-all partition-count doc-seq)]
+                  (xt/submit-tx node (mapv (partial vector ::xt/put) chunk))))))]
+      (run! run-loader loaders)
+      (xt/sync node)
+      {:node node,
+       :domain-state (into {} domain-state)
+       :custom-state (into {} custom-state)
+       :benchmark benchmark
+       :seed seed})))
+
+(defn run
+  [{:keys [node,
+           domain-state,
+           custom-state,
+           benchmark,
+           threads,
+           seed
+           duration
+           think-duration]
+    :or {domain-state {}
+         threads (+ 2 (.availableProcessors (Runtime/getRuntime)))
+         seed 0
+         duration (Duration/parse "PT30S")
+         think-duration Duration/ZERO}}]
+  (let [domain-state (doto (ConcurrentHashMap.) (.putAll domain-state))
+        custom-state (doto (ConcurrentHashMap.) (.putAll custom-state))
+
+        ;; mix seed
+        random (Random. (.nextLong (Random. seed)))
+        clock (Clock/systemUTC)
+
+        uow-ctr (atom -1)
+        uow-defs
+        (for [[t & args] (:tasks benchmark)
+              :let [uow-id (swap! uow-ctr inc)]]
+          (case t
+            :proc
+            (let [[f opts] args
+                  {:keys [weight]
+                   :or {weight 1}} opts]
+              {:uow-id uow-id
+               :uow-name (str uow-id "-" (if (var? f) (.toSymbol ^clojure.lang.Var f) "anon"))
+               :weight weight
+               :proc f
+               :counter (AtomicLong.)})))
+
+        pooled-uow-defs uow-defs
+
+        _ (def pooled-uow-defs uow-defs)
+
+        sample-pooled-uow
+        (weighted-sample-fn (map (juxt identity :weight) pooled-uow-defs))
+
+        think-ms (.toMillis ^Duration think-duration)
+
+        thread-defs
+        (for [thread-id (range threads)
+              :let [thread-name (str (:name benchmark "benchmark") " " (format "[%s/%s]" (inc thread-id) threads))
+                    random (Random. (.nextLong random))]]
+          {:thread-id thread-id
+           :thread-name thread-name
+           :think (fn think [worker] (Thread/sleep think-ms) (sample-pooled-uow (rng worker)))
+           :random random})
+
+        thread-loop
+        (fn [{:keys [random, think]}]
+          (let [thread (Thread/currentThread)
+                worker (map->Worker {:node node
+                                     :random random
+                                     :domain-state domain-state
+                                     :custom-state custom-state
+                                     :clock clock})]
+            (while (not (.isInterrupted thread))
+              (when-some [{:keys [uow-name, ^AtomicLong counter, proc]} (think worker)]
+                (try
+                  (proc worker)
+                  (.incrementAndGet counter)
+                  (catch InterruptedException _ (.interrupt thread))
+                  (catch Throwable e
+                    (log/errorf e "Benchmark proc uncaught exception (uow %s), exiting thread" uow-name)
+                    (.interrupt thread)))))))
+
+        start-thread
+        (fn [{:keys [thread-name] :as thread-def}]
+          (let [bindings (get-thread-bindings)]
+            (doto (Thread. ^Runnable
+                           (fn []
+                             (push-thread-bindings bindings)
+                             (thread-loop thread-def))
+                           (str thread-name))
+              .start)))
+
+        threads-delay (delay (mapv start-thread thread-defs))
+        duration-ms (.toMillis ^Duration duration)
+
+        run-start-ms (atom (System/currentTimeMillis))
+        run-time-ms (atom nil)]
+
+    ;; start the benchmark
     (try
-      (log/info "Inserting transaction functions")
-      (->> (for [[id fvar] fns]
-             ;; todo wrap with histo trace
-             [::xt/put {:xt/id id, :xt/fn @fvar}])
-           (xt/submit-tx node))
+      @threads-delay
+      (let [start (reset! run-start-ms (System/currentTimeMillis))]
+        (Thread/sleep duration-ms)
+        (reset! run-time-ms (- (System/currentTimeMillis) start)))
+      (finally
+        (when (realized? threads-delay)
+          (run! #(.interrupt ^Thread %) @threads-delay)
+          (run! #(.join ^Thread %) @threads-delay))))
 
-      (log/info "Loading data")
-      (reduce (fn [worker [t & args]]
-                (case t
-                  :f (apply (first args) worker (rest args))
-                  :generator
-                  (let [[f opts] args
-                        {:keys [n] :or {n 0}} opts
-                        doc-seq (repeatedly n (partial f worker))
-                        partition-count 512]
-                    (doseq [chunk (partition-all partition-count doc-seq)]
-                      (xt/submit-tx node (mapv (partial vector ::xt/put) chunk)))
-                    worker)))
-              worker
-              loaders)
+    (when-not @run-time-ms
+      (reset! run-time-ms (- (System/currentTimeMillis) @run-start-ms)))
 
-      (catch Throwable e
-        (.close node)
-        (throw e)))
+    (with-meta
+      {:run-time-ms @run-time-ms
+       :transactions (vec (for [{:keys [proc, ^AtomicLong counter]} uow-defs]
+                            {:name (str proc)
+                             :count (.get counter)
+                             :tps (double (/ (.get counter) @run-time-ms))}))}
+      {:node node, :domain-state domain-state, :custom-state custom-state})))
 
-    ))
-
-#_(def auction-mark
-    "A model of the auction-mark benchmark
-
-    https://hstore.cs.brown.edu/projects/auctionmark/"
-    {;; do not require the qualification of attributes
-     :qualify false
-
-     :types
-     {:u-attribute [:alias [:string {:min-length 5, :max-length 32}]]}
-
-     :transactions
-     {:new-user
-
-      {:frequency 0.05
-       :params
-       {:u_id [:next-id :u_id]
-        :u_r_id [:pick-gaussian :r_id]
-        :attributes [:gen [:vector [:u_attribute] {:min-length 8, :max-length 8}]]
-        :now [:now :local-date-time]}
-       :f
-       (fn new-user [node {:keys [u_id, u_r_id, attributes, now]}]
-         (xt/submit-tx node [::xt/put {:xt/id (random-uuid)
-                                       :u_id u_id
-                                       :u_r_id u_r_id
-                                       :u_rating 0
-                                       :u_balance 0.0
-                                       :u_created now
-                                       :u_sattr0 (nth attributes 0)
-                                       :u_sattr1 (nth attributes 1)
-                                       :u_sattr2 (nth attributes 2)
-                                       :u_sattr3 (nth attributes 3)
-                                       :u_sattr4 (nth attributes 4)
-                                       :u_sattr5 (nth attributes 5)
-                                       :u_sattr6 (nth attributes 6)
-                                       :u_sattr7 (nth attributes 7)}]))}
-
-      :new-item
-      {:frequency 0.05
-       :params
-       {:i_id [:next-id :i_id]
-        :u_id [:pick-gaussian :u_id]
-        ;; from category .txt file
-        :c_id [:pick-weighted :cat_weights]
-        :name [:gen [:string]]
-        :description [:gen [:string]]
-        :initial_price [:gen [:double]]
-        :reserve_price [:gen [:nullable [:double]]]
-        :buy_now [:gen [:nullable [:double]]]
-        :attributes [:gen [:string]]
-        }
-
-       }}
-
-     :attrs
-     {:c_id [:long {:id-seq :counter}],
-      :c_name [:string],
-      :c_parent_id [:ref :c_id {:no-cycle true}],
-
-      :gag_c_id [:ref :c_id],
-      :gag_id [:long {:id-seq :counter}],
-      :gag_name [:string],
-
-      :gav_gag_id [:gag_id],
-      :gav_id [:long {:id-seq :counter}],
-
-      :i_c_id [:c_id],
-      :i_current_price [:double],
-      :i_description [:string {:min-length 50, :max-length 255}],
-      :i_end_date [:local-date-time],
-      :i_id [:long {:id-seq :counter, :max-bits 60}],
-      :i_initial_price [:double],
-      :i_name [:string {:min-length 6, :max-length 32}],
-      :i_num_bids [:long],
-      :i_num_global_attrs [:long],
-      :i_num_images [:long],
-      :i_start_date [:local-date-time],
-      :i_status [:int {:elements [0 1 2]}],
-      :i_u_id [:u_id],
-      :i_user_attributes [:string {:min-length 20, :max-length 255}],
-
-      :r_id [:long {:id-seq :counter}],
-      :r_name [:string],
-
-      :u_balance [:double],
-      :u_created [:local-date-time],
-      :u_id [:long {:id-seq :counter}],
-      :u_r_id [:r_id],
-      :u_rating [:long {:min 0, :max 6}],
-
-      :u_sattr0 [:string {:min-length 16, :max-length 64}],
-      :u_sattr1 [:string {:min-length 16, :max-length 64}],
-      :u_sattr2 [:string {:min-length 16, :max-length 64}],
-      :u_sattr3 [:string {:min-length 16, :max-length 64}],
-      :u_sattr4 [:string {:min-length 16, :max-length 64}],
-      :u_sattr5 [:string {:min-length 16, :max-length 64}],
-      :u_sattr6 [:string {:min-length 16, :max-length 64}],
-      :u_sattr7 [:string {:min-length 16, :max-length 64}],
-
-      :ua_created [:local-date-time],
-      :ua_id [:long {:id-seq :counter}],
-      :ua_name [:string {:min-length 5, :max-length 32}],
-      :ua_u_id [:u_id],
-      :ua_value [:string {:min-length 5, :max-length 32}]}
-
-     :entities
-     {:region
-      {:size 62, :req [:r_id :r_name]},
-
-      :global_attribute_group
-      {:size 100, :req [:gag_id :gag_c_id :gag_name]},
-
-      :global_attribute_value
-      {:size [:* :global_attribute_group 10], :req [:gav_id :gav_gag_id]},
-
-      :category
-      {:size 19459,
-       :req [:c_id :c_name :c_parent_id]},
-
-      :user
-      {:size 1000000
-       :req
-       [:u_sattr6
-        :u_r_id
-        :u_id
-        :u_sattr5
-        :u_sattr3
-        :u_sattr4
-        :u_sattr7
-        :u_created
-        :u_sattr1
-        :u_balance
-        :u_rating
-        :u_sattr0
-        :u_sattr2]},
-
-      :user_attributes
-      {:size [:* :user 1.3],
-       :req [:ua_id :ua_u_id :ua_name :ua_value :ua_created]},
-
-      :item
-      {:size [:* :user 10],
-       :attrs
-       [:i_start_date
-        :i_current_price
-        :i_num_images
-        :i_initial_price
-        :i_user_attributes
-        :i_description
-        :i_num_bids
-        :i_c_id
-        :i_id
-        :i_name
-        :i_end_date
-        :i_u_id
-        :i_status
-        :i_num_global_attrs]}}})
+(defn bench [benchmark & {:keys [run-opts, node-opts], :or {run-opts {}, node-opts {}}}]
+  (log/info "Starting node")
+  (with-open [node (xt/start-node node-opts)]
+    (log/info "Starting setup")
+    (let [bench-state (setup node benchmark)]
+      (log/info "Starting run")
+      (:results (run (merge bench-state run-opts))))))
