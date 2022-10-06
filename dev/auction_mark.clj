@@ -136,8 +136,8 @@
          (xt/submit-tx (:node worker)))))
 
 (def tx-fn-apply-seller-fee
-  '(fn [ctx u_id]
-     (let [db (xtdb.api/db ctx)
+  `(fn [ctx u_id]
+     (let [db (xt/db ctx)
            u (xt/entity db u_id)]
        (if u
          [[::xt/put (update u :u_balance dec)]]
@@ -230,6 +230,18 @@
            [[::xt/fn :apply-seller-fee u_id]])
          (xt/submit-tx (:node worker)))))
 
+(defn- proc-get-item [worker]
+  (let [{:keys [node]} worker
+        ;; todo sample bloom to avoid closed
+        ;; should include u_id filter too really?
+        i_id (sample-flat worker item-id)
+        q '[:find (pull ?i [:i_id, :i_u_id, :i_initial_price, :i_current_price])
+            :in [?iid]
+            :where
+            [?i :i_id ?iid]
+            [?i :i_status 0]]]
+    (xt/q (xt/db node) q i_id)))
+
 (defn proc-new-bid!
   [worker])
 
@@ -296,7 +308,8 @@
 
    :tasks
    [[:proc #'proc-new-user {}]
-    [:proc #'proc-new-item {:weight 2}]]})
+    [:proc #'proc-new-item {:weight 2}]
+    [:proc #'proc-get-item {:weight 12}]]})
 
 (defn setup [node benchmark]
   (let [{:keys [loaders, fns]} benchmark
@@ -377,8 +390,6 @@
 
         pooled-uow-defs uow-defs
 
-        _ (def pooled-uow-defs uow-defs)
-
         sample-pooled-uow
         (weighted-sample-fn (map (juxt identity :weight) pooled-uow-defs))
 
@@ -455,4 +466,4 @@
     (log/info "Starting setup")
     (let [bench-state (setup node benchmark)]
       (log/info "Starting run")
-      (:results (run (merge bench-state run-opts))))))
+      (run (merge bench-state run-opts)))))
