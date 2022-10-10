@@ -99,6 +99,7 @@
 (def user-id (partial str "u_"))
 (def region-id (partial str "r_"))
 (def item-id (partial str "i_"))
+(def item-bid-id (partial str "ib_"))
 (def category-id (partial str "c_"))
 (def global-attribute-group-id (partial str "gag_"))
 (def global-attribute-value-id (partial str "gav_"))
@@ -144,21 +145,96 @@
          []))))
 
 (def tx-fn-new-bids
-  '(fn [ctx i_id]
-     (let [db (xt/db ctx)
-           [i nbids]
-           (first
-             (xt/q db '[:find ?i, ?nbids
-                        :in [?iid]
-                        :where
-                        [?i :i_id ?iid]
-                        [?i :i_num_bids ?nbids]
-                        [?i :i_status 0]] i_id))]
-       ;; increment number of bids
-       (when i
-         [[::xt/put {:xt/id i, :i_num_bids (inc nbids)}]])
+  "Transaction function.
 
-       )))
+  Enters a new bid for an item"
+  `(fn [ctx {:keys [i_id
+                    u_id
+                    i_buyer_id
+                    bid
+                    max-bid
+                    ;; pass in from ctr rather than select-max+1 so ctr gets incremented
+                    new-bid-id
+                    ;; 'current timestamp'
+                    now]}]
+     (let [db (xt/db ctx)
+
+           ;; current max bid id
+           [imb imb_ib_id]
+           (-> '[:find ?imb, ?imb_ib_id
+                 :in [?i_id]
+                 :where
+                 [?imb :imb_i_id ?i_id]
+                 [?imb :imb_u_id ?u_id]
+                 [?imb :imb_ib_id ?imb_ib_id]]
+               (xt/q db i_id)
+               first)
+
+           ;; current number of bids
+           [i nbids]
+           (-> '[:find ?i, ?nbids
+                 :in [?i_id]
+                 :where
+                 [?i :i_id ?iid]
+                 [?i :i_num_bids ?nbids]
+                 [?i :i_status 0]]
+               (xt/q db i_id)
+               first)
+
+           ;; current bid/max
+           [curr-bid, curr-max]
+           (when imb_ib_id
+             (-> '[:find ?bid ?max
+                   :in [?imb_ib_id]
+                   :where
+                   [?ib :ib_id ?imb_ib_id]
+                   [?ib :ib_bid ?bid]
+                   [?ib :ib_max_bid ?max-bid]]
+                 (xt/q db imb_ib_id)
+                 first))
+
+           new-bid-win (or (nil? imb_ib_id) (< curr-max max-bid))
+           new-bid (if (and new-bid-win curr-max (< bid curr-max) curr-max) curr-max bid)
+           upd-curr-bid (and curr-bid (not new-bid-win) (< curr-bid bid))]
+
+       (cond->
+         []
+         ;; increment number of bids on item
+         i
+         (conj [::xt/put (assoc (xt/entity db i) :i_num_bids (inc nbids))])
+
+         ;; if new bid exceeds old, bump it
+         upd-curr-bid
+         (conj [:xt/put (assoc (xt/entity db imb) :imb_bid bid)])
+
+         ;; we exceed the old max, win the bid.
+         new-bid-win
+         (conj [:xt/put (assoc (xt/entity db imb) :imb_ib_id new-bid-id
+                                                  :imb_ib_u_id u_id
+                                                  :imb_updated now)])
+
+         ;; no previous max bid, insert new max bid
+         (nil? imb_ib_id)
+         (conj [:xt/put {:xt/id new-bid-id
+                         :imb_i_id i_id
+                         :imb_u_id u_id
+                         :imb_ib_id new-bid-id
+                         :imb_ib_i_id i_id
+                         :imb_ib_u_id u_id
+                         :imb_created now
+                         :imb_updated now}])
+
+         :always
+         ;; add new bid
+         (conj [:xt/put {:xt/id new-bid-id
+                         :ib_id new-bid-id
+                         :ib_i_id i_id
+                         :ib_u_id u_id
+                         :ib_buyer_id i_buyer_id
+                         :ib_bid new-bid
+                         :ib_max_bid max-bid
+                         :ib_created_at now
+                         :ib_updated now}])))))
 
 (defn- sample-category-id [worker]
   (if-some [weighting (::category-weighting (:custom-state worker))]
@@ -192,7 +268,6 @@
         ;; append attribute names to desc
         description-with-attributes
         (let [q '[:find ?gag-name ?gav-name
-                  ;; todo check this param syntax
                   :in [?gag-id ...] [?gav-id ...]
                   :where
                   [?gav-gag-id :gav_gag_id ?gag-id]
@@ -218,7 +293,6 @@
                        :i_end_date end-date
                        ;; open
                        :i_status 0}]]
-           ;; todo fill
            (for [[i image] (map-indexed vector images)
                  :let [ii_id (bit-or (bit-shift-left i 60) (bit-and i_id-raw 0x0FFFFFFFFFFFFFFF))]]
              [::xt/put {:xt/id (str "ii_" ii_id)
@@ -230,10 +304,24 @@
            [[::xt/fn :apply-seller-fee u_id]])
          (xt/submit-tx (:node worker)))))
 
+;; todo new-bid, we will need various sampling functions of items that pair them with their correct uids
+;; plan is too keep track of these items in a seperate index built by tailing the tx-log
+(defn random-waiting-for-purchase-item [worker])
+(defn random-waiting-complete-item [worker])
+(defn random-ending-soon-item [worker])
+(defn random-available-item [worker])
+(defn random-item [worker])
+
+(defn proc-new-bid [worker]
+  ;; we need to have a proc tail the tx-log and index item ids for sampling
+  (let [{::keys [open-items]} (:custom-state worker)]
+    ))
+
 (defn- proc-get-item [worker]
   (let [{:keys [node]} worker
-        ;; todo sample bloom to avoid closed
-        ;; should include u_id filter too really?
+        ;; the benchbase project uses a profile that keeps item pairs around
+        ;; selects only closed items for a particular user profile (they are sampled together)
+        ;; right now this is a totally random sample with one less join than we need.
         i_id (sample-flat worker item-id)
         q '[:find (pull ?i [:i_id, :i_u_id, :i_initial_price, :i_current_price])
             :in [?iid]
@@ -242,8 +330,7 @@
             [?i :i_status 0]]]
     (xt/q (xt/db node) q i_id)))
 
-(defn proc-new-bid!
-  [worker])
+(defn index-secondary [])
 
 (defn read-category-tsv []
   (let [cat-tsv-rows
