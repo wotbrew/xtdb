@@ -4,7 +4,7 @@
             [clojure.java.io :as io]
             [clojure.tools.logging :as log])
   (:import (java.time Instant Clock Duration)
-           (java.util Random Comparator)
+           (java.util Random Comparator ArrayList)
            (java.util.concurrent.atomic AtomicLong)
            (java.util.concurrent ConcurrentHashMap)
            (java.util.function Function)
@@ -144,7 +144,7 @@
          [[:xtdb.api/put (update u :u_balance dec)]]
          []))))
 
-(def tx-fn-new-bids
+(def tx-fn-new-bid
   "Transaction function.
 
   Enters a new bid for an item"
@@ -291,8 +291,7 @@
                        :i_num_global_attrs (count gav-ids)
                        :i_start_date start-date
                        :i_end_date end-date
-                       ;; open
-                       :i_status 0}]]
+                       :i_status :open}]]
            (for [[i image] (map-indexed vector images)
                  :let [ii_id (bit-or (bit-shift-left i 60) (bit-and i_id-raw 0x0FFFFFFFFFFFFFFF))]]
              [::xt/put {:xt/id (str "ii_" ii_id)
@@ -304,18 +303,91 @@
            [[::xt/fn :apply-seller-fee u_id]])
          (xt/submit-tx (:node worker)))))
 
+;; represents a probable state of an item that can be sampled randomly
+(defrecord ItemSample [i_id, i_u_id, i_status, i_end_date, i_num_bids])
+
+(defn- project-item-status
+  [i_status, ^Instant i_end_date, i_num_bids, ^Instant now]
+  (let [remaining (- (.toEpochMilli i_end_date) (.toEpochMilli now))
+        item-ending-soon-ms (* 36000 1000)]
+    (cond
+      (<= remaining 0) :closed
+      (< remaining item-ending-soon-ms) :ending-soon
+      (and (pos? i_num_bids) (not= :closed i_status)) :waiting-for-purchase
+      :else i_status)))
+
+(defn item-status-groups [db ^Instant now]
+  (with-open [items (xt/open-q db
+                          '[:find ?i, ?i_u_id, ?i_status, ?i_end_date, ?i_num_bids
+                            :where
+                            [?i :i_id ?i_id]
+                            [?i :i_u_id ?i_u_id]
+                            [?i :i_status ?i_status]
+                            [?i :i_end_date ?i_end_date]
+                            [?i :i_num_bids ?i_num_bids]])]
+    (let [all (ArrayList.)
+          open (ArrayList.)
+          ending-soon (ArrayList.)
+          waiting-for-purchase (ArrayList.)
+          closed (ArrayList.)]
+      (doseq [[i_id i_u_id i_status ^Instant i_end_date i_num_bids] items
+              :let [projected-status (project-item-status i_status i_end_date i_num_bids now)
+
+                    ^ArrayList alist
+                    (case projected-status
+                      :open open
+                      :closed closed
+                      :waiting-for-purchase waiting-for-purchase
+                      :ending-soon ending-soon)
+
+                    item-sample (->ItemSample i_id i_u_id i_status i_end_date i_num_bids)]]
+        (.add all item-sample)
+        (.add alist item-sample))
+      {:all (vec all)
+       :open (vec open)
+       :ending-soon (vec ending-soon)
+       :waiting-for-purchase (vec waiting-for-purchase)
+       :closed (vec closed)})))
+
+;; do every now and again to provide inputs for item-dependent computations
+(defn index-item-status-groups [worker]
+  (let [{:keys [node, ^ConcurrentHashMap custom-state, ^Clock clock]} worker
+        now (.instant clock)]
+    (with-open [db (xt/open-db node)]
+      (.putAll custom-state {:item-status-groups (item-status-groups db now)}))))
+
+(defn- isg [worker k]
+  (-> worker :custom-state :item-status-groups (get k)))
+
+(defn random-nth [worker coll]
+  (when (seq coll)
+    (let [idx (.nextInt (rng worker) (count coll))]
+      (nth coll idx nil))))
+
 ;; todo new-bid, we will need various sampling functions of items that pair them with their correct uids
 ;; plan is too keep track of these items in a seperate index built by tailing the tx-log
-(defn random-waiting-for-purchase-item [worker])
-(defn random-waiting-complete-item [worker])
-(defn random-ending-soon-item [worker])
-(defn random-available-item [worker])
-(defn random-item [worker])
+
+(defn random-item [worker & {:keys [status] :or {status :all}}]
+  (let [isg (-> worker :custom-state :item-status-groups (get status) vec)
+        item (random-nth worker isg)]
+    item))
+
+(defn- generate-new-bid-params [worker]
+  (let [{:keys [i_id, i_u_id]} (random-item worker :status :open)
+        i_buyer_id (sample-gaussian worker user-id)]
+    (if (and i_buyer_id (= i_buyer_id i_u_id))
+      (generate-new-bid-params worker)
+      {:i_id i_id,
+       :i_u_id i_u_id,
+       :ib_buyer_id i_buyer_id
+       :bid (random-price worker)
+       :max-bid (random-price worker)
+       :new-bid-id (increment worker item-bid-id)
+       :now (current-timestamp worker)})))
 
 (defn proc-new-bid [worker]
-  ;; we need to have a proc tail the tx-log and index item ids for sampling
-  (let [{::keys [open-items]} (:custom-state worker)]
-    ))
+  (let [params (generate-new-bid-params worker)]
+    (xt/submit-tx (:node worker) [[::xt/fn :new-bid params]])))
 
 (defn- proc-get-item [worker]
   (let [{:keys [node]} worker
@@ -329,8 +401,6 @@
             [?i :i_id ?iid]
             [?i :i_status 0]]]
     (xt/q (xt/db node) q i_id)))
-
-(defn index-secondary [])
 
 (defn read-category-tsv []
   (let [cat-tsv-rows
@@ -394,9 +464,11 @@
    :fns {:apply-seller-fee #'tx-fn-apply-seller-fee}
 
    :tasks
-   [[:proc #'proc-new-user {}]
-    [:proc #'proc-new-item {:weight 2}]
-    [:proc #'proc-get-item {:weight 12}]]})
+   [[:proc #'proc-new-user {:weight 0.5}]
+    [:proc #'proc-new-item {:weight 1.0}]
+    [:proc #'proc-get-item {:weight 12.0}]
+    #_
+    [:proc #'proc-new-bid {:weight 2.0}]]})
 
 (defn setup [node benchmark]
   (let [{:keys [loaders, fns]} benchmark
