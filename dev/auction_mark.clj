@@ -137,18 +137,18 @@
          (xt/submit-tx (:node worker)))))
 
 (def tx-fn-apply-seller-fee
-  `(fn [ctx u_id]
-     (let [db (xt/db ctx)
-           u (xt/entity db u_id)]
+  '(fn [ctx u_id]
+     (let [db (xtdb.api/db ctx)
+           u (xtdb.api/entity db u_id)]
        (if u
-         [[::xt/put (update u :u_balance dec)]]
+         [[:xtdb.api/put (update u :u_balance dec)]]
          []))))
 
 (def tx-fn-new-bids
   "Transaction function.
 
   Enters a new bid for an item"
-  `(fn [ctx {:keys [i_id
+  '(fn [ctx {:keys [i_id
                     u_id
                     i_buyer_id
                     bid
@@ -157,40 +157,40 @@
                     new-bid-id
                     ;; 'current timestamp'
                     now]}]
-     (let [db (xt/db ctx)
+     (let [db (xtdb.api/db ctx)
 
            ;; current max bid id
            [imb imb_ib_id]
-           (-> '[:find ?imb, ?imb_ib_id
-                 :in [?i_id]
-                 :where
-                 [?imb :imb_i_id ?i_id]
-                 [?imb :imb_u_id ?u_id]
-                 [?imb :imb_ib_id ?imb_ib_id]]
-               (xt/q db i_id)
+           (-> (quote [:find ?imb, ?imb_ib_id
+                       :in [?i_id]
+                       :where
+                       [?imb :imb_i_id ?i_id]
+                       [?imb :imb_u_id ?u_id]
+                       [?imb :imb_ib_id ?imb_ib_id]])
+               (xtdb.api/q db i_id)
                first)
 
            ;; current number of bids
            [i nbids]
-           (-> '[:find ?i, ?nbids
-                 :in [?i_id]
-                 :where
-                 [?i :i_id ?iid]
-                 [?i :i_num_bids ?nbids]
-                 [?i :i_status 0]]
-               (xt/q db i_id)
+           (-> (quote [:find ?i, ?nbids
+                       :in [?i_id]
+                       :where
+                       [?i :i_id ?iid]
+                       [?i :i_num_bids ?nbids]
+                       [?i :i_status 0]])
+               (xtdb.api/q db i_id)
                first)
 
            ;; current bid/max
            [curr-bid, curr-max]
            (when imb_ib_id
-             (-> '[:find ?bid ?max
-                   :in [?imb_ib_id]
-                   :where
-                   [?ib :ib_id ?imb_ib_id]
-                   [?ib :ib_bid ?bid]
-                   [?ib :ib_max_bid ?max-bid]]
-                 (xt/q db imb_ib_id)
+             (-> (quote [:find ?bid ?max
+                         :in [?imb_ib_id]
+                         :where
+                         [?ib :ib_id ?imb_ib_id]
+                         [?ib :ib_bid ?bid]
+                         [?ib :ib_max_bid ?max-bid]])
+                 (xtdb.api/q db imb_ib_id)
                  first))
 
            new-bid-win (or (nil? imb_ib_id) (< curr-max max-bid))
@@ -201,40 +201,40 @@
          []
          ;; increment number of bids on item
          i
-         (conj [::xt/put (assoc (xt/entity db i) :i_num_bids (inc nbids))])
+         (conj [:xtdb.api/put (assoc (xt/entity db i) :i_num_bids (inc nbids))])
 
          ;; if new bid exceeds old, bump it
          upd-curr-bid
-         (conj [:xt/put (assoc (xt/entity db imb) :imb_bid bid)])
+         (conj [:xtdb.api/put (assoc (xt/entity db imb) :imb_bid bid)])
 
          ;; we exceed the old max, win the bid.
          new-bid-win
-         (conj [:xt/put (assoc (xt/entity db imb) :imb_ib_id new-bid-id
-                                                  :imb_ib_u_id u_id
-                                                  :imb_updated now)])
+         (conj [:xtdb.api/put (assoc (xt/entity db imb) :imb_ib_id new-bid-id
+                                                        :imb_ib_u_id u_id
+                                                        :imb_updated now)])
 
          ;; no previous max bid, insert new max bid
          (nil? imb_ib_id)
-         (conj [:xt/put {:xt/id new-bid-id
-                         :imb_i_id i_id
-                         :imb_u_id u_id
-                         :imb_ib_id new-bid-id
-                         :imb_ib_i_id i_id
-                         :imb_ib_u_id u_id
-                         :imb_created now
-                         :imb_updated now}])
+         (conj [:xtdb.api/put {:xt/id new-bid-id
+                               :imb_i_id i_id
+                               :imb_u_id u_id
+                               :imb_ib_id new-bid-id
+                               :imb_ib_i_id i_id
+                               :imb_ib_u_id u_id
+                               :imb_created now
+                               :imb_updated now}])
 
          :always
          ;; add new bid
-         (conj [:xt/put {:xt/id new-bid-id
-                         :ib_id new-bid-id
-                         :ib_i_id i_id
-                         :ib_u_id u_id
-                         :ib_buyer_id i_buyer_id
-                         :ib_bid new-bid
-                         :ib_max_bid max-bid
-                         :ib_created_at now
-                         :ib_updated now}])))))
+         (conj [:xtdb.api/put {:xt/id new-bid-id
+                               :ib_id new-bid-id
+                               :ib_i_id i_id
+                               :ib_u_id u_id
+                               :ib_buyer_id i_buyer_id
+                               :ib_bid new-bid
+                               :ib_max_bid max-bid
+                               :ib_created_at now
+                               :ib_updated now}])))))
 
 (defn- sample-category-id [worker]
   (if-some [weighting (::category-weighting (:custom-state worker))]
