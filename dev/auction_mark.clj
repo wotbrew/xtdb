@@ -2,7 +2,8 @@
   (:require [xtdb.api :as xt]
             [clojure.string :as str]
             [clojure.java.io :as io]
-            [clojure.tools.logging :as log])
+            [clojure.tools.logging :as log]
+            [xtdb.io :as xio])
   (:import (java.time Instant Clock Duration)
            (java.util Random Comparator ArrayList)
            (java.util.concurrent.atomic AtomicLong)
@@ -318,13 +319,13 @@
 
 (defn item-status-groups [db ^Instant now]
   (with-open [items (xt/open-q db
-                          '[:find ?i, ?i_u_id, ?i_status, ?i_end_date, ?i_num_bids
-                            :where
-                            [?i :i_id ?i_id]
-                            [?i :i_u_id ?i_u_id]
-                            [?i :i_status ?i_status]
-                            [?i :i_end_date ?i_end_date]
-                            [?i :i_num_bids ?i_num_bids]])]
+                               '[:find ?i, ?i_u_id, ?i_status, ?i_end_date, ?i_num_bids
+                                 :where
+                                 [?i :i_id ?i_id]
+                                 [?i :i_u_id ?i_u_id]
+                                 [?i :i_status ?i_status]
+                                 [?i :i_end_date ?i_end_date]
+                                 [?i :i_num_bids ?i_num_bids]])]
     (let [all (ArrayList.)
           open (ArrayList.)
           ending-soon (ArrayList.)
@@ -625,3 +626,12 @@
     (let [bench-state (setup node benchmark)]
       (log/info "Starting run")
       (run (merge bench-state run-opts)))))
+
+(defn rocks-node []
+  (let [kv (fn [] {:xtdb/module 'xtdb.rocksdb/->kv-store,
+                   :db-dir-suffix "rocksdb"
+                   :db-dir (xio/create-tmpdir "auction-mark")})]
+    (xt/start-node
+      {:xtdb/tx-log {:kv-store (kv)}
+       :xtdb/document-store {:kv-store (kv)}
+       :xtdb/index-store {:kv-store (kv)}})))
