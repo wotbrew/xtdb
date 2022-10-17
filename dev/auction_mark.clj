@@ -3,7 +3,9 @@
             [clojure.string :as str]
             [clojure.java.io :as io]
             [clojure.tools.logging :as log]
-            [xtdb.io :as xio])
+            [xtdb.io :as xio]
+            [juxt.clojars-mirrors.hiccup.v2v0v0-alpha2.hiccup2.core :as hiccup2]
+            [clojure.data.json :as json])
   (:import (java.time Instant Clock Duration)
            (java.util Random Comparator ArrayList)
            (java.util.concurrent.atomic AtomicLong)
@@ -11,7 +13,7 @@
            (java.util.function Function)
            (com.google.common.collect MinMaxPriorityQueue)
            (clojure.lang ILookup)
-           (java.io Closeable)
+           (java.io Closeable File)
            (org.HdrHistogram Histogram ConcurrentHistogram AbstractHistogram)))
 
 (set! *warn-on-reflection* false)
@@ -488,20 +490,20 @@
 (defn histogram-summary
   [^AbstractHistogram hist]
   {:count (.getTotalCount hist)
-   :mean (Duration/ofNanos (.getMean hist))
-   :max (Duration/ofNanos (.getMaxValue hist))
-   :min (Duration/ofNanos (.getMinValue hist))
+   :mean (.getMean hist)
+   :max (.getMaxValue hist)
+   :min (.getMinValue hist)
    :percentiles
    (into (sorted-map)
          (for [percentile [0.0
-                           0.75
-                           0.95
-                           0.98
-                           99.0
+                           75
+                           95
+                           98
+                           99
                            99.9
                            99.99
                            99.999]]
-           [percentile (Duration/ofNanos (.getValueAtPercentile hist percentile))]))})
+           [percentile (.getValueAtPercentile hist percentile)]))})
 
 (defn bench-proxy [node]
   (let [last-submitted (atom nil)
@@ -523,7 +525,7 @@
         (fn mark-latency
           ([chm n]
            (mark-latency chm n :global)
-           (when-some [uow *uow*] (mark-latency chm n uow)))
+           (when-some [uow *uow*] (mark-latency chm n (:uow-name uow))))
           ([chm n k]
            (let [^AbstractHistogram hist (.computeIfAbsent chm k compute-latency-histogram)]
              (.recordValue hist (long n)))))
@@ -547,20 +549,21 @@
 
         listener (xt/listen node {::xt/event-type ::xt/indexed-tx} in-cb)
 
-        compute-lag-duration (fn []
-                               (let [[{::xt/keys [tx-id]} ms] @last-submitted]
-                                 (if ms
-                                   (let [{completed-tx-id ::xt/tx-id
-                                          completed-tx-time ::xt/tx-time} (xt/latest-completed-tx node)]
-                                     (if (< completed-tx-id tx-id)
-                                       (Duration/ofMillis (- ms (inst-ms completed-tx-time)))
-                                       Duration/ZERO))
-                                   Duration/ZERO)))
+        compute-lag-nanos
+        (fn []
+          (let [[{::xt/keys [tx-id]} ms] @last-submitted]
+            (if ms
+              (let [{completed-tx-id ::xt/tx-id
+                     completed-tx-time ::xt/tx-time} (xt/latest-completed-tx node)]
+                (if (< completed-tx-id tx-id)
+                  (* (long 1e6) (- ms (inst-ms completed-tx-time)))
+                  0))
+              0)))
 
         get-stats
         (fn []
           {:latency {:submit (get-latency-breakdown submit-latency-histograms)}
-           :lag {:duration (compute-lag-duration),
+           :lag {:duration (compute-lag-nanos),
                  :count (- (.get submit-counter) (.get indexed-counter))}})]
     (reify
       ILookup
@@ -622,7 +625,6 @@
 
     (log/info "Inserting transaction functions")
     (->> (for [[id fvar] fns]
-           ;; todo wrap with histo trace
            [::xt/put {:xt/id id, :xt/fn @fvar}])
          (xt/submit-tx node-proxy))
 
@@ -681,7 +683,7 @@
                   {:keys [freq]
                    :or {freq {:ratio 0.1}}} opts]
               {:uow-id uow-id
-               :uow-name (str uow-id "-" (if (var? f) (.toSymbol ^clojure.lang.Var f) "anon"))
+               :uow-name (if (var? f) (name (.toSymbol ^clojure.lang.Var f)) "anon")
                :freq freq
                :proc f
                :counter (AtomicLong.)
@@ -692,7 +694,7 @@
                   {:keys [weight]
                    :or {weight 1}} opts]
               {:uow-id uow-id
-               :uow-name (str uow-id "-" (if (var? f) (.toSymbol ^clojure.lang.Var f) "anon"))
+               :uow-name (if (var? f) (name (.toSymbol ^clojure.lang.Var f)) "anon")
                :pool true
                :weight weight
                :proc f
@@ -739,10 +741,11 @@
                                      :clock clock})]
             (while (not (.isInterrupted thread))
               (try
-                (when-some [{:keys [uow-name, ^AtomicLong counter, ^AbstractHistogram histogram, proc]} (think worker)]
+                (when-some [{:keys [uow-name, ^AtomicLong counter, ^AbstractHistogram histogram, proc] :as uow} (think worker)]
                   (try
                     (let [start (System/nanoTime)]
-                      (proc worker)
+                      (binding [*uow* uow]
+                        (proc worker))
                       (.recordValue histogram (- (System/nanoTime) start)))
                     (.incrementAndGet counter)
                     (catch InterruptedException _ (.interrupt thread))
@@ -788,11 +791,11 @@
       (reset! run-time-nanos (- (System/nanoTime) @run-start-nanos)))
 
     (with-meta
-      {:duration (Duration/ofNanos @run-time-nanos)
+      {:duration @run-time-nanos
        :stats (:stats node-proxy)
        :rps (calc-rps (reduce + 0N (map #(.get (:counter %)) uow-defs)))
-       :transactions (vec (for [{:keys [proc, histogram, ^AtomicLong counter]} uow-defs]
-                            {:name (str proc),
+       :transactions (vec (for [{:keys [uow-name, proc, histogram, ^AtomicLong counter]} uow-defs]
+                            {:name uow-name,
                              :rps (calc-rps (.get counter))
                              :count (.get counter)
                              :latency (histogram-summary histogram)}))}
@@ -810,7 +813,9 @@
     (assert (and node domain-state custom-state))
     (->Worker node (Random.) domain-state custom-state (Clock/systemUTC))))
 
-(defn bench [benchmark & {:keys [run-opts, node-opts], :or {run-opts {}, node-opts {}}}]
+(defn bench [benchmark & {:keys [run-opts,
+                                 node-opts],
+                          :or {run-opts {}, node-opts {}}}]
   (log/info "Starting node")
   (with-open [node (xt/start-node node-opts)]
     (log/info "Starting setup")
@@ -834,3 +839,82 @@
          (take 1000)
          (some #(when (= tx-id (::xt/tx-id %))
                   %)))))
+
+(defn pretty-nanos [nanos]
+  (str (Duration/ofNanos nanos)))
+
+(defn vega-percentiles [{:keys [title, percentiles]}]
+  (let [percentile-datum (fn [[percentile nanos]]
+                           {:percentile percentile
+                            :value (* 1e-6 nanos)})]
+    {:mark "bar"
+     :data {:values (mapv percentile-datum percentiles)}
+     :encoding
+     {:x {:field "percentile",
+          :title "Percentile"
+          :type "nominal"}
+      :y {:field "value",
+          :title "Millis"
+          :type "quantitative"}}
+     :title title}))
+
+;; todo requests over time
+
+(defn find-transaction [rs name]
+  (some #(when (= name (:name %)) %) (:transactions rs)))
+
+(defn transaction-stats [rs transaction]
+  (let [{:keys [name]} transaction]
+    {:name name
+     :submit-latency (-> rs :stats :latency :submit (get name))
+     :transaction-latency (:latency transaction)}))
+
+(defn global-stats [rs]
+  (let [{:keys [stats]} rs
+        {:keys [latency]} stats]
+    {:name "All"
+     :submit-latency (:global (:submit latency))}))
+
+(defn vega-stats [stats]
+  {:title (:name stats)
+   :hconcat (into [] (for [k [:transaction-latency
+                              :submit-latency]
+                           :let [{:keys [percentiles]} (k stats)]
+                           :when percentiles]
+                       (vega-percentiles
+                         {:title (name k)
+                          :percentiles percentiles})))})
+
+(defn vega-graph [rs]
+  (let [{:keys [stats, transactions]} rs]
+    {:width "container"
+     :vconcat
+     (vec (concat
+            [(vega-stats (global-stats rs))]
+            (for [transaction transactions]
+              (vega-stats (transaction-stats rs transaction)))))}))
+
+(defn vega-hiccup [title vega]
+  (list
+    [:html
+     [:head
+      [:title title]
+      [:meta {:charset "utf-8"}]
+      [:script {:src "https://cdn.jsdelivr.net/npm/vega@5.22.1"}]
+      [:script {:src "https://cdn.jsdelivr.net/npm/vega-lite@5.6.0"}]
+      [:script {:src "https://cdn.jsdelivr.net/npm/vega-embed@6.21.0"}]
+      [:style {:media "screen"}
+       ".vega-actions a {
+        margin-right: 5px;
+      }"]]
+     [:body
+      [:h1 title]
+      [:div#vis]
+      [:script (hiccup2/raw (format "vegaEmbed('#vis', %s);" (json/write-str vega)))]]]))
+
+(defn show-html-report [title rs]
+  (let [f (File/createTempFile "xtdb-benchmark-report" ".html")]
+    (spit f (hiccup2/html
+              {}
+              (vega-hiccup title (vega-graph rs))))
+    (clojure.java.browse/browse-url (io/as-url f))))
