@@ -138,7 +138,7 @@
          (xt/submit-tx (:node worker)))))
 
 (def tx-fn-apply-seller-fee
-  '(fn [ctx u_id]
+  '(fn apply-seller-fee [ctx u_id]
      (let [db (xtdb.api/db ctx)
            u (xtdb.api/entity db u_id)]
        (if u
@@ -149,15 +149,15 @@
   "Transaction function.
 
   Enters a new bid for an item"
-  '(fn [ctx {:keys [i_id
-                    u_id
-                    i_buyer_id
-                    bid
-                    max-bid
-                    ;; pass in from ctr rather than select-max+1 so ctr gets incremented
-                    new-bid-id
-                    ;; 'current timestamp'
-                    now]}]
+  '(fn new-bid [ctx {:keys [i_id
+                            u_id
+                            i_buyer_id
+                            bid
+                            max-bid
+                            ;; pass in from ctr rather than select-max+1 so ctr gets incremented
+                            new-bid-id
+                            ;; 'current timestamp'
+                            now]}]
      (let [db (xtdb.api/db ctx)
 
            ;; current max bid id
@@ -168,7 +168,7 @@
                        [?imb :imb_i_id ?i_id]
                        [?imb :imb_u_id ?u_id]
                        [?imb :imb_ib_id ?imb_ib_id]])
-               (xtdb.api/q db i_id)
+               (as-> q (xtdb.api/q db q i_id))
                first)
 
            ;; current number of bids
@@ -179,7 +179,7 @@
                        [?i :i_id ?iid]
                        [?i :i_num_bids ?nbids]
                        [?i :i_status 0]])
-               (xtdb.api/q db i_id)
+               (as-> q (xtdb.api/q db q i_id))
                first)
 
            ;; current bid/max
@@ -191,7 +191,7 @@
                          [?ib :ib_id ?imb_ib_id]
                          [?ib :ib_bid ?bid]
                          [?ib :ib_max_bid ?max-bid]])
-                 (xtdb.api/q db imb_ib_id)
+                 (as-> q (xtdb.api/q db q imb_ib_id))
                  first))
 
            new-bid-win (or (nil? imb_ib_id) (< curr-max max-bid))
@@ -202,18 +202,16 @@
          []
          ;; increment number of bids on item
          i
-         (conj [:xtdb.api/put (assoc (xt/entity db i) :i_num_bids (inc nbids))])
+         (conj [:xtdb.api/put (assoc (xtdb.api/entity db i) :i_num_bids (inc nbids))])
 
          ;; if new bid exceeds old, bump it
          upd-curr-bid
-         (conj [:xtdb.api/put (assoc (xt/entity db imb) :imb_bid bid)])
+         (conj [:xtdb.api/put (assoc (xtdb.api/entity db imb) :imb_bid bid)])
 
          ;; we exceed the old max, win the bid.
-         new-bid-win
-         (conj [:xtdb.api/put (assoc (xt/entity db imb) :imb_ib_id new-bid-id
-                                                        :imb_ib_u_id u_id
-                                                        :imb_updated now)])
-
+         (and curr-bid new-bid-win)
+         (conj [:xtdb.api/put (assoc (xtdb.api/entity db imb) :imb_ib_id new-bid-id
+                                                              :imb_ib_u_id u_id :imb_updated now)])
          ;; no previous max bid, insert new max bid
          (nil? imb_ib_id)
          (conj [:xtdb.api/put {:xt/id new-bid-id
@@ -331,7 +329,7 @@
           ending-soon (ArrayList.)
           waiting-for-purchase (ArrayList.)
           closed (ArrayList.)]
-      (doseq [[i_id i_u_id i_status ^Instant i_end_date i_num_bids] items
+      (doseq [[i_id i_u_id i_status ^Instant i_end_date i_num_bids] (iterator-seq items)
               :let [projected-status (project-item-status i_status i_end_date i_num_bids now)
 
                     ^ArrayList alist
@@ -388,7 +386,8 @@
 
 (defn proc-new-bid [worker]
   (let [params (generate-new-bid-params worker)]
-    (xt/submit-tx (:node worker) [[::xt/fn :new-bid params]])))
+    (when (and (:i_id params) (:i_u_id params))
+      (xt/submit-tx (:node worker) [[::xt/fn :new-bid params]]))))
 
 (defn- proc-get-item [worker]
   (let [{:keys [node]} worker
@@ -462,13 +461,16 @@
     [:generator #'generate-region {:n 75}]
     [:generator #'generate-category {:n 16908}]]
 
-   :fns {:apply-seller-fee #'tx-fn-apply-seller-fee}
+   :fns
+   {:apply-seller-fee #'tx-fn-apply-seller-fee
+    :new-bid #'tx-fn-new-bid}
 
    :tasks
    [[:proc #'proc-new-user {:weight 0.5}]
     [:proc #'proc-new-item {:weight 1.0}]
     [:proc #'proc-get-item {:weight 12.0}]
-    [:proc #'proc-new-bid {:weight 2.0}]]})
+    [:proc #'proc-new-bid {:weight 2.0}]
+    [:job #'index-item-status-groups {:freq {:ratio 0.2}}]]})
 
 (defn setup [node benchmark]
   (let [{:keys [loaders, fns]} benchmark
@@ -524,7 +526,8 @@
          threads (+ 2 (.availableProcessors (Runtime/getRuntime)))
          seed 0
          duration (Duration/parse "PT30S")
-         think-duration Duration/ZERO}}]
+         think-duration Duration/ZERO}
+    :as args}]
   (let [domain-state (doto (ConcurrentHashMap.) (.putAll domain-state))
         custom-state (doto (ConcurrentHashMap.) (.putAll custom-state))
 
@@ -537,17 +540,32 @@
         (for [[t & args] (:tasks benchmark)
               :let [uow-id (swap! uow-ctr inc)]]
           (case t
+            :job
+            (let [[f opts] args
+                  {:keys [freq]
+                   :or {freq {:ratio 0.1}}} opts]
+              {:uow-id uow-id
+               :uow-name (str uow-id "-" (if (var? f) (.toSymbol ^clojure.lang.Var f) "anon"))
+               :freq freq
+               :proc f
+               :counter (AtomicLong.)})
+
             :proc
             (let [[f opts] args
                   {:keys [weight]
                    :or {weight 1}} opts]
               {:uow-id uow-id
                :uow-name (str uow-id "-" (if (var? f) (.toSymbol ^clojure.lang.Var f) "anon"))
+               :pool true
                :weight weight
                :proc f
                :counter (AtomicLong.)})))
 
-        pooled-uow-defs uow-defs
+        pooled-uow-defs
+        (filter :pool uow-defs)
+
+        job-defs
+        (remove :pool uow-defs)
 
         sample-pooled-uow
         (weighted-sample-fn (map (juxt identity :weight) pooled-uow-defs))
@@ -555,13 +573,23 @@
         think-ms (.toMillis ^Duration think-duration)
 
         thread-defs
-        (for [thread-id (range threads)
-              :let [thread-name (str (:name benchmark "benchmark") " " (format "[%s/%s]" (inc thread-id) threads))
-                    random (Random. (.nextLong random))]]
-          {:thread-id thread-id
-           :thread-name thread-name
-           :think (fn think [worker] (Thread/sleep think-ms) (sample-pooled-uow (rng worker)))
-           :random random})
+        (concat
+          (for [{:keys [uow-name, freq] :as job} job-defs
+                :let [{:keys [ratio]} freq
+                      ms (long (* ratio (.toMillis ^Duration duration)))
+                      think-first (atom false)]]
+            {:thread-name uow-name
+             :think (fn think-job [_]
+                      (when @think-first (when (pos? ms) (Thread/sleep ms)))
+                      (reset! think-first true)
+                      job)
+             :random random})
+          (for [thread-id (range threads)
+                :let [thread-name (str (:name benchmark "benchmark-pool") " " (format "[%s/%s]" (inc thread-id) threads))
+                      random (Random. (.nextLong random))]]
+            {:thread-name thread-name
+             :think (fn think-proc [worker] (Thread/sleep think-ms) (sample-pooled-uow (rng worker)))
+             :random random}))
 
         thread-loop
         (fn [{:keys [random, think]}]
@@ -572,14 +600,17 @@
                                      :custom-state custom-state
                                      :clock clock})]
             (while (not (.isInterrupted thread))
-              (when-some [{:keys [uow-name, ^AtomicLong counter, proc]} (think worker)]
-                (try
-                  (proc worker)
-                  (.incrementAndGet counter)
-                  (catch InterruptedException _ (.interrupt thread))
-                  (catch Throwable e
-                    (log/errorf e "Benchmark proc uncaught exception (uow %s), exiting thread" uow-name)
-                    (.interrupt thread)))))))
+              (try
+                (when-some [{:keys [uow-name, ^AtomicLong counter, proc]} (think worker)]
+                  (try
+                    (proc worker)
+                    (.incrementAndGet counter)
+                    (catch InterruptedException _ (.interrupt thread))
+                    (catch Throwable e
+                      (log/errorf e "Benchmark proc uncaught exception (uow %s), exiting thread" uow-name)
+                      (.interrupt thread))))
+                (catch InterruptedException _
+                  (.interrupt thread))))))
 
         start-thread
         (fn [{:keys [thread-name] :as thread-def}]
@@ -616,8 +647,17 @@
        :transactions (vec (for [{:keys [proc, ^AtomicLong counter]} uow-defs]
                             {:name (str proc)
                              :count (.get counter)
-                             :tps (double (/ (.get counter) @run-time-ms))}))}
-      {:node node, :domain-state domain-state, :custom-state custom-state})))
+                             :tps (double (/ (.get counter) (/ @run-time-ms 1000)))}))}
+      {:node node, :args, args, :domain-state domain-state, :custom-state custom-state})))
+
+(defn run-more [results]
+  (let [{:keys [args, domain-state, custom-state]} (meta results)]
+    (run (merge args {:domain-state domain-state, :custom-state custom-state}))))
+
+(defn post-bench-worker [results]
+  (let [{:keys [node, domain-state, custom-state]} (meta results)]
+    (assert (and node domain-state custom-state))
+    (->Worker node (Random.) domain-state custom-state (Clock/systemUTC))))
 
 (defn bench [benchmark & {:keys [run-opts, node-opts], :or {run-opts {}, node-opts {}}}]
   (log/info "Starting node")
@@ -635,3 +675,10 @@
       {:xtdb/tx-log {:kv-store (kv)}
        :xtdb/document-store {:kv-store (kv)}
        :xtdb/index-store {:kv-store (kv)}})))
+
+(defn tx-view [node tx-id]
+  (with-open [cur (xt/open-tx-log node (- tx-id 100) true)]
+    (->> (iterator-seq cur)
+         (take 1000)
+         (some #(when (= tx-id (::xt/tx-id %))
+                  %)))))
