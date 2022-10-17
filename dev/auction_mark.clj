@@ -9,7 +9,12 @@
            (java.util.concurrent.atomic AtomicLong)
            (java.util.concurrent ConcurrentHashMap)
            (java.util.function Function)
-           (com.google.common.collect MinMaxPriorityQueue)))
+           (com.google.common.collect MinMaxPriorityQueue)
+           (clojure.lang ILookup)
+           (java.io Closeable)
+           (org.HdrHistogram Histogram ConcurrentHistogram AbstractHistogram)))
+
+(set! *warn-on-reflection* false)
 
 (defrecord Worker [node random domain-state custom-state clock])
 
@@ -355,16 +360,10 @@
     (with-open [db (xt/open-db node)]
       (.putAll custom-state {:item-status-groups (item-status-groups db now)}))))
 
-(defn- isg [worker k]
-  (-> worker :custom-state :item-status-groups (get k)))
-
 (defn random-nth [worker coll]
   (when (seq coll)
     (let [idx (.nextInt (rng worker) (count coll))]
       (nth coll idx nil))))
-
-;; todo new-bid, we will need various sampling functions of items that pair them with their correct uids
-;; plan is too keep track of these items in a seperate index built by tailing the tx-log
 
 (defn random-item [worker & {:keys [status] :or {status :all}}]
   (let [isg (-> worker :custom-state :item-status-groups (get status) vec)
@@ -389,7 +388,7 @@
     (when (and (:i_id params) (:i_u_id params))
       (xt/submit-tx (:node worker) [[::xt/fn :new-bid params]]))))
 
-(defn- proc-get-item [worker]
+(defn proc-get-item [worker]
   (let [{:keys [node]} worker
         ;; the benchbase project uses a profile that keeps item pairs around
         ;; selects only closed items for a particular user profile (they are sampled together)
@@ -472,6 +471,139 @@
     [:proc #'proc-new-bid {:weight 2.0}]
     [:job #'index-item-status-groups {:freq {:ratio 0.2}}]]})
 
+;; measurement
+
+;; histogram (global and per proc)
+;; eager query latency (q)
+;; lazy query open latency (open-q)
+;; lazy query open lifetime (open-q to close)
+;; submit latency
+;; transaction e2e latency (e.g submit-2-index)
+
+;; transaction is the tricky one
+;; will have to put the tx-id in a sorted set and have a listener thread mark it completed if it is below or equal to the last tx-id.
+
+(def ^:dynamic *uow* nil)
+
+(defn histogram-summary
+  [^AbstractHistogram hist]
+  {:count (.getTotalCount hist)
+   :mean (Duration/ofNanos (.getMean hist))
+   :max (Duration/ofNanos (.getMaxValue hist))
+   :min (Duration/ofNanos (.getMinValue hist))
+   :percentiles
+   (into (sorted-map)
+         (for [percentile [0.0
+                           0.75
+                           0.95
+                           0.98
+                           99.0
+                           99.9
+                           99.99
+                           99.999]]
+           [percentile (Duration/ofNanos (.getValueAtPercentile hist percentile))]))})
+
+(defn bench-proxy [node]
+  (let [last-submitted (atom nil)
+        submit-counter (AtomicLong.)
+        indexed-counter (AtomicLong.)
+
+        eager-query-latency (ConcurrentHashMap.)
+        lazy-query-open-latency (ConcurrentHashMap.)
+        lazy-query-lifetime-latency (ConcurrentHashMap.)
+        submit-latency-histograms (ConcurrentHashMap.)
+        tx-latency-histograms (ConcurrentHashMap.)
+
+        compute-latency-histogram
+        (reify Function
+          (apply [_ _]
+            (ConcurrentHistogram. (long 120e9) 2)))
+
+        mark-latency
+        (fn mark-latency
+          ([chm n]
+           (mark-latency chm n :global)
+           (when-some [uow *uow*] (mark-latency chm n uow)))
+          ([chm n k]
+           (let [^AbstractHistogram hist (.computeIfAbsent chm k compute-latency-histogram)]
+             (.recordValue hist (long n)))))
+
+        record-latency-f
+        (fn [chm f]
+          (let [start (System/nanoTime)
+                ret (f)]
+            (mark-latency chm (- (System/nanoTime) start))
+            ret))
+
+        get-latency-breakdown
+        (fn [chm]
+          (->> (for [[k ^AbstractHistogram hist] (seq chm)]
+                 [k (histogram-summary hist)])
+               (into {})))
+
+        in-cb (fn [{::xt/keys [tx-id, tx-time]}]
+                (.getAndIncrement indexed-counter)
+                nil)
+
+        listener (xt/listen node {::xt/event-type ::xt/indexed-tx} in-cb)
+
+        compute-lag-duration (fn []
+                               (let [[{::xt/keys [tx-id]} ms] @last-submitted]
+                                 (if ms
+                                   (let [{completed-tx-id ::xt/tx-id
+                                          completed-tx-time ::xt/tx-time} (xt/latest-completed-tx node)]
+                                     (if (< completed-tx-id tx-id)
+                                       (Duration/ofMillis (- ms (inst-ms completed-tx-time)))
+                                       Duration/ZERO))
+                                   Duration/ZERO)))
+
+        get-stats
+        (fn []
+          {:latency {:submit (get-latency-breakdown submit-latency-histograms)}
+           :lag {:duration (compute-lag-duration),
+                 :count (- (.get submit-counter) (.get indexed-counter))}})]
+    (reify
+      ILookup
+      (valAt [this k] (.valAt this k nil))
+      (valAt [_ k default]
+        (case k
+          :stats (get-stats)
+          default))
+      xt/PXtdb
+      (status [_] (xt/status node))
+      (tx-committed? [_ submitted-tx] (xt/tx-committed? node submitted-tx))
+      (sync [_] (xt/sync node))
+      (sync [_ timeout] (xt/sync node timeout))
+      (sync [_ tx-time timeout] (xt/sync node tx-time timeout))
+      (await-tx-time [_ tx-time] (xt/await-tx-time node tx-time))
+      (await-tx-time [_ tx-time timeout] (xt/await-tx-time node tx-time timeout))
+      (await-tx [_ tx] (xt/await-tx node tx))
+      (await-tx [_ tx timeout] (xt/await-tx node tx timeout))
+      (listen [node event-opts f] (xt/listen node event-opts f))
+      (latest-completed-tx [_] (xt/latest-completed-tx node))
+      (latest-submitted-tx [_] (xt/latest-submitted-tx node))
+      (attribute-stats [_] (xt/attribute-stats node))
+      (active-queries [_] (xt/active-queries node))
+      (recent-queries [_] (xt/recent-queries node))
+      (slowest-queries [_] (xt/slowest-queries node))
+      xt/PXtdbSubmitClient
+      (submit-tx-async [_ tx-ops] (xt/submit-tx-async node tx-ops))
+      (submit-tx-async [_ tx-ops opts] (xt/submit-tx-async node tx-ops opts))
+      (submit-tx [this tx-ops] (xt/submit-tx this tx-ops {}))
+      (submit-tx [_ tx-ops opts]
+        (let [ret (record-latency-f submit-latency-histograms #(xt/submit-tx node tx-ops opts))]
+          (reset! last-submitted [ret (System/currentTimeMillis)])
+          (.incrementAndGet submit-counter)
+          ret))
+      (open-tx-log [_ after-tx-id with-ops?] (xt/open-tx-log node after-tx-id with-ops?))
+      xt/DBProvider
+      (db [_] (xt/db node))
+      (db [_ valid-time-or-basis] (xt/db node valid-time-or-basis))
+      (open-db [_] (xt/open-db node))
+      (open-db [_ valid-time-or-basis] (xt/open-db node valid-time-or-basis))
+      Closeable
+      (close [_] (.close listener)))))
+
 (defn setup [node benchmark]
   (let [{:keys [loaders, fns]} benchmark
         clock (Clock/systemUTC)
@@ -479,9 +611,10 @@
         random (Random. seed)
         domain-state (ConcurrentHashMap.)
         custom-state (ConcurrentHashMap.)
+        node-proxy (bench-proxy node)
         worker
         (map->Worker
-          {:node node,
+          {:node node-proxy,
            :random random,
            :domain-state domain-state
            :custom-state custom-state
@@ -491,7 +624,7 @@
     (->> (for [[id fvar] fns]
            ;; todo wrap with histo trace
            [::xt/put {:xt/id id, :xt/fn @fvar}])
-         (xt/submit-tx node))
+         (xt/submit-tx node-proxy))
 
     (log/info "Loading data")
     (let [run-loader
@@ -504,9 +637,10 @@
                     doc-seq (repeatedly n (partial f worker))
                     partition-count 512]
                 (doseq [chunk (partition-all partition-count doc-seq)]
-                  (xt/submit-tx node (mapv (partial vector ::xt/put) chunk))))))]
+                  (xt/submit-tx node-proxy (mapv (partial vector ::xt/put) chunk))))))]
       (run! run-loader loaders)
       (xt/sync node)
+      (.close node-proxy)
       {:node node,
        :domain-state (into {} domain-state)
        :custom-state (into {} custom-state)
@@ -531,6 +665,8 @@
   (let [domain-state (doto (ConcurrentHashMap.) (.putAll domain-state))
         custom-state (doto (ConcurrentHashMap.) (.putAll custom-state))
 
+        node-proxy (bench-proxy node)
+
         ;; mix seed
         random (Random. (.nextLong (Random. seed)))
         clock (Clock/systemUTC)
@@ -548,7 +684,8 @@
                :uow-name (str uow-id "-" (if (var? f) (.toSymbol ^clojure.lang.Var f) "anon"))
                :freq freq
                :proc f
-               :counter (AtomicLong.)})
+               :counter (AtomicLong.)
+               :histogram (Histogram. 240e9 2)})
 
             :proc
             (let [[f opts] args
@@ -559,7 +696,8 @@
                :pool true
                :weight weight
                :proc f
-               :counter (AtomicLong.)})))
+               :counter (AtomicLong.)
+               :histogram (ConcurrentHistogram. 240e9 2)})))
 
         pooled-uow-defs
         (filter :pool uow-defs)
@@ -594,16 +732,18 @@
         thread-loop
         (fn [{:keys [random, think]}]
           (let [thread (Thread/currentThread)
-                worker (map->Worker {:node node
+                worker (map->Worker {:node node-proxy
                                      :random random
                                      :domain-state domain-state
                                      :custom-state custom-state
                                      :clock clock})]
             (while (not (.isInterrupted thread))
               (try
-                (when-some [{:keys [uow-name, ^AtomicLong counter, proc]} (think worker)]
+                (when-some [{:keys [uow-name, ^AtomicLong counter, ^AbstractHistogram histogram, proc]} (think worker)]
                   (try
-                    (proc worker)
+                    (let [start (System/nanoTime)]
+                      (proc worker)
+                      (.recordValue histogram (- (System/nanoTime) start)))
                     (.incrementAndGet counter)
                     (catch InterruptedException _ (.interrupt thread))
                     (catch Throwable e
@@ -625,30 +765,41 @@
         threads-delay (delay (mapv start-thread thread-defs))
         duration-ms (.toMillis ^Duration duration)
 
-        run-start-ms (atom (System/currentTimeMillis))
-        run-time-ms (atom nil)]
+        run-start-nanos (atom (System/nanoTime))
+        run-time-nanos (atom nil)
+
+        calc-rps
+        (fn [n]
+          (* 1e9 (/ n @run-time-nanos)))]
 
     ;; start the benchmark
     (try
       @threads-delay
-      (let [start (reset! run-start-ms (System/currentTimeMillis))]
+      (let [start (reset! run-start-nanos (System/nanoTime))]
         (Thread/sleep duration-ms)
-        (reset! run-time-ms (- (System/currentTimeMillis) start)))
+        (reset! run-time-nanos (- (System/nanoTime) start)))
       (finally
         (when (realized? threads-delay)
-          (run! #(.interrupt ^Thread %) @threads-delay)
-          (run! #(.join ^Thread %) @threads-delay))))
+          (run! #(.interrupt %) @threads-delay)
+          (run! #(.join %) @threads-delay))
+        (.close node-proxy)))
 
-    (when-not @run-time-ms
-      (reset! run-time-ms (- (System/currentTimeMillis) @run-start-ms)))
+    (when-not @run-time-nanos
+      (reset! run-time-nanos (- (System/nanoTime) @run-start-nanos)))
 
     (with-meta
-      {:run-time-ms @run-time-ms
-       :transactions (vec (for [{:keys [proc, ^AtomicLong counter]} uow-defs]
-                            {:name (str proc)
+      {:duration (Duration/ofNanos @run-time-nanos)
+       :stats (:stats node-proxy)
+       :rps (calc-rps (reduce + 0N (map #(.get (:counter %)) uow-defs)))
+       :transactions (vec (for [{:keys [proc, histogram, ^AtomicLong counter]} uow-defs]
+                            {:name (str proc),
+                             :rps (calc-rps (.get counter))
                              :count (.get counter)
-                             :tps (double (/ (.get counter) (/ @run-time-ms 1000)))}))}
-      {:node node, :args, args, :domain-state domain-state, :custom-state custom-state})))
+                             :latency (histogram-summary histogram)}))}
+      {:node node,
+       :args, args,
+       :domain-state domain-state,
+       :custom-state custom-state})))
 
 (defn run-more [results]
   (let [{:keys [args, domain-state, custom-state]} (meta results)]
@@ -667,14 +818,15 @@
       (log/info "Starting run")
       (run (merge bench-state run-opts)))))
 
-(defn rocks-node []
+(defn rocks-opts []
   (let [kv (fn [] {:xtdb/module 'xtdb.rocksdb/->kv-store,
                    :db-dir-suffix "rocksdb"
                    :db-dir (xio/create-tmpdir "auction-mark")})]
-    (xt/start-node
-      {:xtdb/tx-log {:kv-store (kv)}
-       :xtdb/document-store {:kv-store (kv)}
-       :xtdb/index-store {:kv-store (kv)}})))
+    {:xtdb/tx-log {:kv-store (kv)}
+     :xtdb/document-store {:kv-store (kv)}
+     :xtdb/index-store {:kv-store (kv)}}))
+
+(defn rocks-node [] (xt/start-node (rocks-opts)))
 
 (defn tx-view [node tx-id]
   (with-open [cur (xt/open-tx-log node (- tx-id 100) true)]
