@@ -467,7 +467,6 @@
    [[:proc #'proc-new-user {:weight 0.5}]
     [:proc #'proc-new-item {:weight 1.0}]
     [:proc #'proc-get-item {:weight 12.0}]
-    #_
     [:proc #'proc-new-bid {:weight 2.0}]]})
 
 (defn setup [node benchmark]
