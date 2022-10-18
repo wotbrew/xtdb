@@ -7,14 +7,20 @@
             [juxt.clojars-mirrors.hiccup.v2v0v0-alpha2.hiccup2.core :as hiccup2]
             [clojure.data.json :as json])
   (:import (java.time Instant Clock Duration)
-           (java.util Random Comparator ArrayList)
+           (java.util Random Comparator ArrayList HashMap List)
            (java.util.concurrent.atomic AtomicLong)
            (java.util.concurrent ConcurrentHashMap)
-           (java.util.function Function)
+           (java.util.function Function Supplier)
            (com.google.common.collect MinMaxPriorityQueue)
            (clojure.lang ILookup)
            (java.io Closeable File)
-           (org.HdrHistogram Histogram ConcurrentHistogram AbstractHistogram)))
+           (org.HdrHistogram Histogram ConcurrentHistogram AbstractHistogram)
+           (io.micrometer.core.instrument.simple SimpleMeterRegistry)
+           (io.micrometer.core.instrument.binder.jvm ClassLoaderMetrics JvmMemoryMetrics JvmGcMetrics JvmThreadMetrics JvmHeapPressureMetrics)
+           (io.micrometer.core.instrument.binder MeterBinder)
+           (io.micrometer.core.instrument.binder.system ProcessorMetrics)
+           (io.micrometer.core.instrument Meter Measurement MeterRegistry Timer Tag Statistic Gauge)
+           (com.yammer.metrics.core MetricsRegistry)))
 
 (set! *warn-on-reflection* false)
 
@@ -505,43 +511,89 @@
                            99.999]]
            [percentile (.getValueAtPercentile hist percentile)]))})
 
-(defn bench-proxy [node]
+(defn meter-reg ^MeterRegistry []
+  (let [meter-reg (SimpleMeterRegistry.)
+        bind-metrics (fn [& metrics] (run! #(.bindTo % meter-reg) metrics))]
+    (bind-metrics
+      (ClassLoaderMetrics.)
+      (JvmMemoryMetrics.)
+      (JvmHeapPressureMetrics.)
+      (JvmGcMetrics.)
+      (ProcessorMetrics.)
+      (JvmThreadMetrics.))
+    meter-reg))
+
+(defrecord MeterSample [meter time-ms statistic value])
+
+(defn meter-sampler
+  "Not thread safe, call to take a sample of meters in the given registry.
+  Should be called on a sampler thread as part of a benchmark/load run.
+
+  Can be called (sampler :summarize) for a data summary of the time series."
+  [^MeterRegistry meter-reg]
+  ;; most naive impl possible right now - can simply vary the sample rate according to duration / dimensionality
+  ;; if memory is an issue
+  (let [sample-list (ArrayList.)]
+    (fn send-msg
+      ([] (send-msg :sample))
+      ([msg]
+       (case msg
+         :summarize
+         (vec (for [[meter-name samples]
+                    (group-by
+                      (fn [{:keys [^Meter meter]}]
+                        (-> meter .getId .getName))
+                      sample-list)
+                    [^Meter meter samples] (group-by :meter samples)
+                    :let [series (->> meter .getId .getTagsAsIterable
+                                      (map (fn [^Tag t] (str (.getKey t) "=" (.getValue t))))
+                                      (str/join ", "))
+                          series (not-empty series)]
+                    [statistic samples] (group-by :statistic samples)]
+                {:id (str/join " " [meter-name statistic series])
+                 :metric (str/join " " [meter-name statistic])
+                 :meter meter-name
+                 :unit (-> meter .getId .getBaseUnit)
+                 :series series
+                 :statistic statistic
+                 :samples (mapv (fn [{:keys [value, time-ms]}]
+                                  {:value value
+                                   :time-ms time-ms})
+                                samples)}))
+         :sample
+         (let [time-ms (System/currentTimeMillis)]
+           (doseq [^Meter meter (.getMeters meter-reg)
+                   ^Measurement measurement (.measure meter)]
+             (.add sample-list (->MeterSample meter time-ms (.getTagValueRepresentation (.getStatistic measurement)) (.getValue measurement))))))))))
+
+(defn install-proxy-node-meters!
+  [^MeterRegistry meter-reg]
+  (let [timer #(-> (Timer/builder %)
+                   (.minimumExpectedValue (Duration/ofNanos 1))
+                   (.maximumExpectedValue (Duration/ofMinutes 2))
+                   (.publishPercentiles (double-array [0.75 0.85 0.95 0.98 0.99 0.999]))
+                   (.register meter-reg))]
+    {:submit-tx-timer (timer "node.submit-tx")}))
+
+(defn new-fn-gauge
+  ([reg meter-name f] (new-fn-gauge ref meter-name f {}))
+  ([^MeterRegistry reg meter-name f opts]
+   (-> (Gauge/builder
+         meter-name
+         (reify Supplier
+           (get [_] (f))))
+       (cond-> (:unit opts) (.baseUnit (str (:unit opts))))
+       (.register reg))))
+
+(defn bench-proxy [node ^MeterRegistry meter-reg]
   (let [last-submitted (atom nil)
         submit-counter (AtomicLong.)
         indexed-counter (AtomicLong.)
 
-        eager-query-latency (ConcurrentHashMap.)
-        lazy-query-open-latency (ConcurrentHashMap.)
-        lazy-query-lifetime-latency (ConcurrentHashMap.)
-        submit-latency-histograms (ConcurrentHashMap.)
-        tx-latency-histograms (ConcurrentHashMap.)
+        {:keys [^Timer submit-tx-timer]}
+        (install-proxy-node-meters! meter-reg)
 
-        compute-latency-histogram
-        (reify Function
-          (apply [_ _]
-            (ConcurrentHistogram. (long 120e9) 2)))
-
-        mark-latency
-        (fn mark-latency
-          ([chm n]
-           (mark-latency chm n :global)
-           (when-some [uow *uow*] (mark-latency chm n (:uow-name uow))))
-          ([chm n k]
-           (let [^AbstractHistogram hist (.computeIfAbsent chm k compute-latency-histogram)]
-             (.recordValue hist (long n)))))
-
-        record-latency-f
-        (fn [chm f]
-          (let [start (System/nanoTime)
-                ret (f)]
-            (mark-latency chm (- (System/nanoTime) start))
-            ret))
-
-        get-latency-breakdown
-        (fn [chm]
-          (->> (for [[k ^AbstractHistogram hist] (seq chm)]
-                 [k (histogram-summary hist)])
-               (into {})))
+        fn-gauge (partial new-fn-gauge meter-reg)
 
         in-cb (fn [{::xt/keys [tx-id, tx-time]}]
                 (.getAndIncrement indexed-counter)
@@ -560,19 +612,15 @@
                   0))
               0)))
 
-        get-stats
-        (fn []
-          {:latency {:submit (get-latency-breakdown submit-latency-histograms)}
-           :lag {:duration (compute-lag-nanos),
-                 :count (- (.get submit-counter) (.get indexed-counter))}})]
-    (reify
-      ILookup
-      (valAt [this k] (.valAt this k nil))
-      (valAt [_ k default]
-        (case k
-          :stats (get-stats)
-          default))
-      xt/PXtdb
+        compute-lag-count
+        (fn [] (- (.get submit-counter) (.get indexed-counter)))]
+
+    (fn-gauge "node.tx.lag.transactions" compute-lag-count {:unit "transactions"})
+    (fn-gauge "node.tx.lag.delay" (comp #(/ % 1e9) compute-lag-nanos) {:unit "seconds"})
+    (fn-gauge "node.kv.keys" #(:xtdb.kv/estimate-num-keys (xt/status node) 0) {:unit "count"})
+    (fn-gauge "node.kv.size" #(:xtdb.kv/size (xt/status node) 0) {:unit "bytes"})
+
+    (reify xt/PXtdb
       (status [_] (xt/status node))
       (tx-committed? [_ submitted-tx] (xt/tx-committed? node submitted-tx))
       (sync [_] (xt/sync node))
@@ -594,7 +642,7 @@
       (submit-tx-async [_ tx-ops opts] (xt/submit-tx-async node tx-ops opts))
       (submit-tx [this tx-ops] (xt/submit-tx this tx-ops {}))
       (submit-tx [_ tx-ops opts]
-        (let [ret (record-latency-f submit-latency-histograms #(xt/submit-tx node tx-ops opts))]
+        (let [ret (.recordCallable submit-tx-timer ^Callable #(xt/submit-tx node tx-ops opts))]
           (reset! last-submitted [ret (System/currentTimeMillis)])
           (.incrementAndGet submit-counter)
           ret))
@@ -614,7 +662,7 @@
         random (Random. seed)
         domain-state (ConcurrentHashMap.)
         custom-state (ConcurrentHashMap.)
-        node-proxy (bench-proxy node)
+        node-proxy node
         worker
         (map->Worker
           {:node node-proxy,
@@ -642,7 +690,6 @@
                   (xt/submit-tx node-proxy (mapv (partial vector ::xt/put) chunk))))))]
       (run! run-loader loaders)
       (xt/sync node)
-      (.close node-proxy)
       {:node node,
        :domain-state (into {} domain-state)
        :custom-state (into {} custom-state)
@@ -667,7 +714,13 @@
   (let [domain-state (doto (ConcurrentHashMap.) (.putAll domain-state))
         custom-state (doto (ConcurrentHashMap.) (.putAll custom-state))
 
-        node-proxy (bench-proxy node)
+        meter-reg (meter-reg)
+        meter-sampler (meter-sampler meter-reg)
+
+        sample-meters #(meter-sampler :sample)
+        summarize-metrics #(meter-sampler :summarize)
+
+        node-proxy (bench-proxy node meter-reg)
 
         ;; mix seed
         random (Random. (.nextLong (Random. seed)))
@@ -773,13 +826,19 @@
 
         calc-rps
         (fn [n]
-          (* 1e9 (/ n @run-time-nanos)))]
+          (* 1e9 (/ n @run-time-nanos)))
+
+        sample-rate-ms (max 100 (/ duration-ms 60))
+        ]
 
     ;; start the benchmark
     (try
       @threads-delay
-      (let [start (reset! run-start-nanos (System/nanoTime))]
-        (Thread/sleep duration-ms)
+      (let [start (reset! run-start-nanos (System/nanoTime))
+            desired-end (long (+ (.toNanos duration) (System/nanoTime)))]
+        (while (< (System/nanoTime) desired-end)
+          (sample-meters)
+          (Thread/sleep sample-rate-ms))
         (reset! run-time-nanos (- (System/nanoTime) start)))
       (finally
         (when (realized? threads-delay)
@@ -792,6 +851,7 @@
 
     (with-meta
       {:duration @run-time-nanos
+       :metrics (summarize-metrics)
        :stats (:stats node-proxy)
        :rps (calc-rps (reduce + 0N (map #(.get (:counter %)) uow-defs)))
        :transactions (vec (for [{:keys [uow-name, proc, histogram, ^AtomicLong counter]} uow-defs]
@@ -875,46 +935,120 @@
     {:name "All"
      :submit-latency (:global (:submit latency))}))
 
+(defn jvm-stats [rs]
+  (let [bytes->mb #(/ (double %) 1024.0 1024.0)
+        select-map {"jvm.memory.used" {"value" {:title "Heap memory used" :unit "MB", :transform bytes->mb}}
+                    "jvm.threads.live" {"value" {:title "Number of live threads" :unit "Threads"}}
+                    "jvm.buffer.memory.used" {"value" {:unit "MB", :transform bytes->mb}}
+                    "process.cpu.usage" {"value" {:title "Java CPU usage"}}
+                    "system.cpu.usage" {"value" {:title "System CPU usage"}}}
+        {:keys [meters]} rs]
+    {:title "JVM"
+     :hconcat (vec (for [[meter-name {:keys [desc, stats]}] (sort meters)]
+                     {:title meter-name
+                      :hconcat (vec (for [[stat samples] (sort stats)]
+                                      {:title stat
+                                       :description desc
+                                       :mark {:type "area", :line true}
+                                       :data {:values (mapv (fn [{:keys [time, value]}]
+                                                              {:time (str time)
+                                                               :value value}) samples)
+                                              :format {:parse {:time "utc:'%Q'"}}}
+                                       :encoding {:x {:field "time"
+                                                      :type "temporal"
+                                                      :title "Time"}
+                                                  :y {:field "value"
+                                                      :type "quantitative"
+                                                      :title "Value"}
+                                                  }}))}))}))
+
 (defn vega-stats [stats]
   {:title (:name stats)
-   :hconcat (into [] (for [k [:transaction-latency
-                              :submit-latency]
-                           :let [{:keys [percentiles]} (k stats)]
-                           :when percentiles]
-                       (vega-percentiles
-                         {:title (name k)
-                          :percentiles percentiles})))})
+   :hconcat (vec (for [k [:transaction-latency
+                          :submit-latency]
+                       :let [{:keys [percentiles]} (k stats)]
+                       :when percentiles]
+                   (vega-percentiles
+                     {:title (name k)
+                      :percentiles percentiles})))})
 
-(defn vega-graph [rs]
-  (let [{:keys [stats, transactions]} rs]
-    {:width "container"
-     :vconcat
-     (vec (concat
-            [(vega-stats (global-stats rs))]
-            (for [transaction transactions]
-              (vega-stats (transaction-stats rs transaction)))))}))
 
-(defn vega-hiccup [title vega]
-  (list
-    [:html
-     [:head
-      [:title title]
-      [:meta {:charset "utf-8"}]
-      [:script {:src "https://cdn.jsdelivr.net/npm/vega@5.22.1"}]
-      [:script {:src "https://cdn.jsdelivr.net/npm/vega-lite@5.6.0"}]
-      [:script {:src "https://cdn.jsdelivr.net/npm/vega-embed@6.21.0"}]
-      [:style {:media "screen"}
-       ".vega-actions a {
-        margin-right: 5px;
-      }"]]
-     [:body
-      [:h1 title]
-      [:div#vis]
-      [:script (hiccup2/raw (format "vegaEmbed('#vis', %s);" (json/write-str vega)))]]]))
+(defn vega-plots [metric-data]
+  (vec
+    (for [[metric metric-data] (sort-by key (group-by :metric metric-data))]
+      {:title metric
+       :hconcat (vec (for [[[statistic unit] metric-data] (sort-by key (group-by (juxt :statistic :unit) metric-data))]
+                       {:title statistic
+                        :data {:values (vec (for [{:keys [series samples]} metric-data
+                                                  {:keys [time-ms, value]} samples
+                                                  :when (Double/isFinite value)]
+                                              {:time (str time-ms)
+                                               :series series
+                                               :value value}))
+                               :format {:parse {:time "utc:'%Q'"}}}
+                        :mark {:type "area", :line true}
+                        :encoding {:x {:field "time"
+                                       :type "temporal"
+                                       :title "Time"}
+                                   :y {:field "value"
+                                       :type "quantitative"
+                                       :title (or unit "Value")}
+                                   :color
+                                   (when (< 1 (count metric-data))
+                                     {:field "series",
+                                      :legend {}
+                                      :type "nominal"})}}))})))
+
+(defn group-metrics [rs]
+  (let [{:keys [metrics]} rs
+
+        group-fn
+        (fn [{:keys [meter]}]
+          (condp #(str/starts-with? %2 %1) meter
+            "node." "001 - XTDB Node"
+            "jvm.gc" "002 - JVM GC"
+            "system." "003 - System / Process"
+            "process." "003 - System / Process"
+            "jvm.buffer" "004 - JVM Buffer"
+            "005 - Other"))
+
+        metric-groups (group-by group-fn metrics)]
+
+    metric-groups))
+
+(defn hiccup-report [title result & more]
+  (let [id-from-thing
+        (let [ctr (atom 0)]
+          (memoize (fn [_] (str "id" (swap! ctr inc)))))]
+    (list
+      [:html
+       [:head
+        [:title title]
+        [:meta {:charset "utf-8"}]
+        [:script {:src "https://cdn.jsdelivr.net/npm/vega@5.22.1"}]
+        [:script {:src "https://cdn.jsdelivr.net/npm/vega-lite@5.6.0"}]
+        [:script {:src "https://cdn.jsdelivr.net/npm/vega-embed@6.21.0"}]
+        [:style {:media "screen"}
+         ".vega-actions a {
+          margin-right: 5px;
+        }"]]
+       [:body
+        [:h1 title]
+        (for [[group metric-data] (sort-by key (group-metrics result))]
+          (list [:h2 group]
+                (for [meter (sort (set (map :meter metric-data)))]
+                  [:div {:id (id-from-thing meter)}])))
+        [:script
+         (->> (for [[meter metric-data] (group-by :meter (:metrics result))]
+                (format "vegaEmbed('#%s', %s);" (id-from-thing meter)
+                        (json/write-str
+                          {:hconcat (vega-plots metric-data)})))
+              (str/join "\n")
+              hiccup2/raw)]]])))
 
 (defn show-html-report [title rs]
   (let [f (File/createTempFile "xtdb-benchmark-report" ".html")]
     (spit f (hiccup2/html
               {}
-              (vega-hiccup title (vega-graph rs))))
+              (hiccup-report title rs)))
     (clojure.java.browse/browse-url (io/as-url f))))

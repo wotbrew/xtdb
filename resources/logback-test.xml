@@ -16,7 +16,7 @@
   <logger name="xtdb.jdbc" level="WARN" />
   <logger name="xtdb.mem-kv" level="ERROR" />
   <logger name="xtdb.rdf" level="ERROR" />
-  <logger name="xtdb.tx" level="ERROR" />
+  <logger name="xtdb.tx" level="WARN" />
 
   <logger name="org.apache.kafka" level="ERROR" />
   <logger name="org.apache.zookeeper" level="ERROR" />

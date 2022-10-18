@@ -138,7 +138,9 @@
    ;; xtdb-core test dep
    [clj-commons/fs "1.6.310"]
 
-   [org.hdrhistogram/HdrHistogram "2.1.12"]]
+   ;; for bench monitoring
+   [org.hdrhistogram/HdrHistogram "2.1.12"]
+   [io.micrometer/micrometer-core "1.9.5"]]
 
   :source-paths ["dev"]
 
