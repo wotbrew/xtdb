@@ -138,9 +138,9 @@
    ;; xtdb-core test dep
    [clj-commons/fs "1.6.310"]
 
-   ;; for bench monitoring
-   [org.hdrhistogram/HdrHistogram "2.1.12"]
-   [io.micrometer/micrometer-core "1.9.5"]]
+   ;; for bench measurement
+   [io.micrometer/micrometer-core "1.9.5"]
+   [com.github.oshi/oshi-core "6.3.0"]]
 
   :source-paths ["dev"]
 

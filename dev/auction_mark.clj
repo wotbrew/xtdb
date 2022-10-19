@@ -16,7 +16,8 @@
            (io.micrometer.core.instrument.simple SimpleMeterRegistry)
            (io.micrometer.core.instrument.binder.jvm ClassLoaderMetrics JvmMemoryMetrics JvmGcMetrics JvmThreadMetrics JvmHeapPressureMetrics)
            (io.micrometer.core.instrument.binder.system ProcessorMetrics)
-           (io.micrometer.core.instrument Meter Measurement MeterRegistry Timer Tag Gauge)))
+           (io.micrometer.core.instrument Meter Measurement MeterRegistry Timer Tag Gauge)
+           (oshi SystemInfo)))
 
 (set! *warn-on-reflection* false)
 
@@ -601,10 +602,14 @@
         compute-lag-count
         (fn [] (- (.get submit-counter) (.get indexed-counter)))]
 
+    ;; todo gauge indexed count, transaction lag can be derived, lag can simply be the time measure
     (fn-gauge "node.tx.lag.transactions" compute-lag-count {:unit "transactions"})
     (fn-gauge "node.tx.lag.delay" (comp #(/ % 1e9) compute-lag-nanos) {:unit "seconds"})
+
     (fn-gauge "node.kv.keys" #(:xtdb.kv/estimate-num-keys (xt/status node) 0) {:unit "count"})
     (fn-gauge "node.kv.size" #(:xtdb.kv/size (xt/status node) 0) {:unit "bytes"})
+
+
 
     (reify xt/PXtdb
       (status [_] (xt/status node))
@@ -868,6 +873,27 @@
     (assert (and node domain-state custom-state))
     (->Worker node (Random.) domain-state custom-state (Clock/systemUTC))))
 
+(defn get-system-info
+  "Returns data about the hardware / OS running this JVM."
+  []
+  (let [si (SystemInfo.)
+        os (.getOperatingSystem si)
+        os-version (.getVersionInfo os)
+        os-codename (.getCodeName os-version)
+        os-version-number (.getVersion os-version)
+        arch (System/getProperty "os.arch")
+        hardware (.getHardware si)
+        cpu (.getProcessor hardware)
+        cpu-identifier (.getProcessorIdentifier cpu)
+        cpu-name (.getName cpu-identifier)
+        cpu-core-count (.getPhysicalProcessorCount cpu)
+        cpu-max-freq (.getMaxFreq cpu)
+        ram (.getMemory hardware)]
+    {:arch arch
+     :os (str/join " " (remove str/blank? [(.getFamily os) os-codename os-version-number]))
+     :memory (format "%sGB" (/ (long (.getTotal ram)) (* 1024 1024 1024)))
+     :cpu (format "%s, %s cores, %.2fGHZ max" cpu-name cpu-core-count (double (/ cpu-max-freq 1e9)))}))
+
 (defn bench [benchmark & {:keys [run-opts,
                                  node-opts],
                           :or {run-opts {}, node-opts {}}}]
@@ -876,7 +902,8 @@
     (log/info "Starting setup")
     (let [bench-state (setup node benchmark)]
       (log/info "Starting run")
-      (run (merge bench-state run-opts)))))
+      (assoc (run (merge bench-state run-opts))
+        :system (get-system-info)))))
 
 (defn rocks-opts []
   (let [kv (fn [] {:xtdb/module 'xtdb.rocksdb/->kv-store,
@@ -920,26 +947,48 @@
                                                           {:keys [time-ms, value]} samples
                                                           :when (Double/isFinite value)]
                                                       {:time (str time-ms)
-                                                       :facet vs-label
+                                                       :config vs-label
                                                        :series series
                                                        :value value}))
                                        :format {:parse {:time "utc:'%Q'"}}}
                                  any-series (some (comp not-empty :series) metric-data)
-                                 spec {:mark {:type "area", :line true}
+
+                                 series-dimension (and any-series (< 1 (count metric-data)))
+                                 vs-dimension (= 2 (bounded-count 2 (keep :vs-label metric-data)))
+
+                                 stack-series series-dimension
+                                 stack-vs (and (not stack-series) vs-dimension)
+                                 facet-vs (and vs-dimension (not stack-vs))
+
+                                 layer-instead-of-stack
+                                 (cond stack-series (str/ends-with? metric "percentile value")
+                                       stack-vs true)
+
+                                 mark-type (if stack-vs "line" "area")
+
+                                 spec {:mark {:type mark-type, :line true, :tooltip true}
                                        :encoding {:x {:field "time"
                                                       :type "temporal"
                                                       :title "Time"}
-                                                  :y {:field "value"
-                                                      :type "quantitative"
-                                                      :title (or unit "Value")}
+                                                  :y (let [y {:field "value"
+                                                              :type "quantitative"
+                                                              :title (or unit "Value")}]
+                                                       (if layer-instead-of-stack
+                                                         (assoc y :stack false)
+                                                         y))
                                                   :color
-                                                  (when (and any-series (< 1 (count metric-data)))
+                                                  (cond
+                                                    stack-series
                                                     {:field "series",
-                                                     :legend {}
+                                                     :legend {:labelLimit 280}
+                                                     :type "nominal"}
+                                                    stack-vs
+                                                    {:field "config",
+                                                     :legend {:labelLimit 280}
                                                      :type "nominal"})}}]]
-                       (if (some :vs-label metric-data)
+                       (if facet-vs
                          {:data data
-                          :facet {:column {:field "facet"}
+                          :facet {:column {:field "config"}
                                   :header {:title nil}}
                           :spec spec}
                          (assoc spec :data data))))})))
@@ -963,7 +1012,7 @@
 
     metric-groups))
 
-(defn hiccup-report [title result & more]
+(defn hiccup-report [title report]
   (let [id-from-thing
         (let [ctr (atom 0)]
           (memoize (fn [_] (str "id" (swap! ctr inc)))))]
@@ -981,23 +1030,33 @@
         }"]]
        [:body
         [:h1 title]
-        (for [[group metric-data] (sort-by key (group-metrics result))]
-          (list [:h2 group]
-                (for [meter (sort (set (map :meter metric-data)))]
-                  [:div {:id (id-from-thing meter)}])))
+
+        [:div
+         [:table
+          [:thead [:th "config"] [:th "arch"] [:th "os"] [:th "cpu"] [:th "memory"]]
+          [:tbody
+           (for [{:keys [label, system]} (:systems report)
+                 :let [{:keys [arch, os, cpu, memory]} system]]
+             [:tr [:th label] [:td arch] [:td os] [:td cpu] [:td memory]])]]]
+
+        [:div
+         (for [[group metric-data] (sort-by key (group-metrics report))]
+           (list [:h2 group]
+                 (for [meter (sort (set (map :meter metric-data)))]
+                   [:div {:id (id-from-thing meter)}])))]
         [:script
-         (->> (for [[meter metric-data] (group-by :meter (:metrics result))]
+         (->> (for [[meter metric-data] (group-by :meter (:metrics report))]
                 (format "vegaEmbed('#%s', %s);" (id-from-thing meter)
                         (json/write-str
                           {:hconcat (vega-plots metric-data)})))
               (str/join "\n")
               hiccup2/raw)]]])))
 
-(defn show-html-report [title rs]
+(defn show-html-report [rs]
   (let [f (File/createTempFile "xtdb-benchmark-report" ".html")]
     (spit f (hiccup2/html
               {}
-              (hiccup-report title rs)))
+              (hiccup-report (:title rs "Benchmark report") rs)))
     (clojure.java.browse/browse-url (io/as-url f))))
 
 (defn- normalize-time [report]
@@ -1017,7 +1076,9 @@
         key-seq (map first pair-seq)
         ;; index without order
         report-map (apply hash-map label report more)]
-    {:metrics (vec (for [[i label] (map-indexed vector key-seq)
+    {:title (str/join " vs " key-seq)
+     :systems (for [label key-seq] {:label label, :system (:system report)})
+     :metrics (vec (for [[i label] (map-indexed vector key-seq)
                          :let [{:keys [metrics]} (normalize-time (report-map label))]
                          metric metrics]
                      (assoc metric :vs-label (str label))))}))
