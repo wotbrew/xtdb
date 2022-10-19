@@ -507,7 +507,7 @@
   "Not thread safe, call to take a sample of meters in the given registry.
   Should be called on a sampler thread as part of a benchmark/load run.
 
-  Can be called (sampler :summarize) for a data summary of the time series."
+  Can be called (sampler :summarize) for a data summary of the captured metric time series."
   [^MeterRegistry meter-reg]
   ;; most naive impl possible right now - can simply vary the sample rate according to duration / dimensionality
   ;; if memory is an issue
@@ -528,6 +528,7 @@
                                       (str/join ", "))
                           series (not-empty series)]
                     [statistic samples] (group-by :statistic samples)]
+                ;; todo count->rate automatically on non-neg deriv transform (can be a new 'statistic' dimension of counts)
                 {:id (str/join " " [meter-name statistic series])
                  :metric (str/join " " [meter-name statistic])
                  :meter meter-name
@@ -559,7 +560,7 @@
     {:submit-tx-timer (timer "node.submit-tx")}))
 
 (defn new-fn-gauge
-  ([reg meter-name f] (new-fn-gauge ref meter-name f {}))
+  ([reg meter-name f] (new-fn-gauge reg meter-name f {}))
   ([^MeterRegistry reg meter-name f opts]
    (-> (Gauge/builder
          meter-name
@@ -827,6 +828,7 @@
 
     ;; start the benchmark
     (try
+      (System/gc)
       @threads-delay
       (let [start (reset! run-start-nanos (System/nanoTime))
             desired-end (long (+ (.toNanos duration) (System/nanoTime)))]
@@ -884,6 +886,14 @@
      :xtdb/document-store {:kv-store (kv)}
      :xtdb/index-store {:kv-store (kv)}}))
 
+(defn lmdb-opts []
+  (let [kv (fn [] {:xtdb/module 'xtdb.lmdb/->kv-store,
+                   :db-dir-suffix "lmdb"
+                   :db-dir (xio/create-tmpdir "auction-mark")})]
+    {:xtdb/tx-log {:kv-store (kv)}
+     :xtdb/document-store {:kv-store (kv)}
+     :xtdb/index-store {:kv-store (kv)}}))
+
 (defn rocks-node [] (xt/start-node (rocks-opts)))
 
 (defn tx-view [node tx-id]
@@ -905,26 +915,33 @@
   (vec
     (for [[metric metric-data] (sort-by key (group-by :metric metric-data))]
       {:title metric
-       :hconcat (vec (for [[[statistic unit] metric-data] (sort-by key (group-by (juxt :statistic :unit) metric-data))]
-                       {:data {:values (vec (for [{:keys [series samples]} metric-data
-                                                  {:keys [time-ms, value]} samples
-                                                  :when (Double/isFinite value)]
-                                              {:time (str time-ms)
-                                               :series series
-                                               :value value}))
-                               :format {:parse {:time "utc:'%Q'"}}}
-                        :mark {:type "area", :line true}
-                        :encoding {:x {:field "time"
-                                       :type "temporal"
-                                       :title "Time"}
-                                   :y {:field "value"
-                                       :type "quantitative"
-                                       :title (or unit "Value")}
-                                   :color
-                                   (when (< 1 (count metric-data))
-                                     {:field "series",
-                                      :legend {}
-                                      :type "nominal"})}}))})))
+       :hconcat (vec (for [[[_statistic unit] metric-data] (sort-by key (group-by (juxt :statistic :unit) metric-data))
+                           :let [data {:values (vec (for [{:keys [vs-label, series, samples]} metric-data
+                                                          {:keys [time-ms, value]} samples
+                                                          :when (Double/isFinite value)]
+                                                      {:time (str time-ms)
+                                                       :facet vs-label
+                                                       :series series
+                                                       :value value}))
+                                       :format {:parse {:time "utc:'%Q'"}}}
+                                 any-series (some (comp not-empty :series) metric-data)
+                                 spec {:mark {:type "area", :line true}
+                                       :encoding {:x {:field "time"
+                                                      :type "temporal"
+                                                      :title "Time"}
+                                                  :y {:field "value"
+                                                      :type "quantitative"
+                                                      :title (or unit "Value")}
+                                                  :color
+                                                  (when (and any-series (< 1 (count metric-data)))
+                                                    {:field "series",
+                                                     :legend {}
+                                                     :type "nominal"})}}]]
+                       (if (some :vs-label metric-data)
+                         {:data data
+                          :facet {:column {:field "facet"}}
+                          :spec spec}
+                         (assoc spec :data data))))})))
 
 (defn group-metrics [rs]
   (let [{:keys [metrics]} rs
@@ -939,7 +956,7 @@
             "jvm.buffer" "004 - JVM Buffer"
             "system." "005 - System / Process"
             "process." "005 - System / Process"
-            "005 - Other"))
+            "006 - Other"))
 
         metric-groups (group-by group-fn metrics)]
 
@@ -981,3 +998,25 @@
               {}
               (hiccup-report title rs)))
     (clojure.java.browse/browse-url (io/as-url f))))
+
+(defn- normalize-time [report]
+  (let [{:keys [metrics]} report
+        min-time (->> metrics
+                      (mapcat :samples)
+                      (reduce #(min %1 (:time-ms %2)) Long/MAX_VALUE))
+        new-metrics (for [metric metrics
+                          :let [{:keys [samples]} metric
+                                new-samples (mapv #(update % :time-ms - min-time) samples)]]
+                      (assoc metric :samples new-samples))]
+    (assoc report :metrics (vec new-metrics))))
+
+(defn vs [label report & more]
+  (let [pair-seq (cons [label report] (partition 2 more))
+        ;; with order
+        key-seq (map first pair-seq)
+        ;; index without order
+        report-map (apply hash-map label report more)]
+    {:metrics (vec (for [[i label] (map-indexed vector key-seq)
+                         :let [{:keys [metrics]} (normalize-time (report-map label))]
+                         metric metrics]
+                     (assoc metric :vs-label (str label))))}))
