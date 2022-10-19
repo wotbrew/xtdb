@@ -939,7 +939,8 @@
                                                      :type "nominal"})}}]]
                        (if (some :vs-label metric-data)
                          {:data data
-                          :facet {:column {:field "facet"}}
+                          :facet {:column {:field "facet"}
+                                  :header {:title nil}}
                           :spec spec}
                          (assoc spec :data data))))})))
 
