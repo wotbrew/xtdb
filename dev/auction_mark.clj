@@ -5,8 +5,10 @@
             [clojure.tools.logging :as log]
             [xtdb.io :as xio]
             [juxt.clojars-mirrors.hiccup.v2v0v0-alpha2.hiccup2.core :as hiccup2]
-            [clojure.data.json :as json])
-  (:import (java.time Instant Clock Duration)
+            [clojure.data.json :as json]
+            [xtdb.bus :as bus]
+            [clojure.java.shell :as sh])
+  (:import (java.time Instant Clock Duration LocalDate)
            (java.util Random Comparator ArrayList)
            (java.util.concurrent.atomic AtomicLong)
            (java.util.concurrent ConcurrentHashMap)
@@ -16,8 +18,33 @@
            (io.micrometer.core.instrument.simple SimpleMeterRegistry)
            (io.micrometer.core.instrument.binder.jvm ClassLoaderMetrics JvmMemoryMetrics JvmGcMetrics JvmThreadMetrics JvmHeapPressureMetrics)
            (io.micrometer.core.instrument.binder.system ProcessorMetrics)
-           (io.micrometer.core.instrument Meter Measurement MeterRegistry Timer Tag Gauge)
+           (io.micrometer.core.instrument Meter Measurement MeterRegistry Timer Tag Gauge Timer$Sample)
            (oshi SystemInfo)))
+
+;; plan
+;; run-for-duration type oltp benchmarks
+;; sys under stress
+;; vary config and compare
+;; few requirements, runs from repl or ci, but can be run on remote infra (e.g ec2/ecs)
+;; sut can be a configuration of XT within the current process, or a particular XT git ref, jvm, opts + configuration in some other process (possibly remote!)
+;; bench definition is data with hooks into code for procedure/load definitions
+;; output/reports are data
+;; time series focus with summary, .html visualisation to start with
+;; interface to start benchmarks in all cases is the REPL
+
+;; docker is essential if we wanna test kafka/jdbc et al
+;; not sure if correct for the JVM under-test.
+;; may want option to compare docker rocks say to bare metal or even VM's with fast disks (customers will do this)
+
+;; remote idea: https://docs.docker.com/cloud/ecs-integration/ might be a lot easier than cform and the same thing works on
+;; laptop
+
+;; ec2 is probably easiest, need to create a vpc, sg and single instance for many tests could use a cformation template
+;; for tear down once test is complete
+
+;; if we do docker via compose first it helps us just have one thing that runs the tests and destroys them
+
+
 
 (set! *warn-on-reflection* false)
 
@@ -488,8 +515,6 @@
 ;; transaction is the tricky one
 ;; will have to put the tx-id in a sorted set and have a listener thread mark it completed if it is below or equal to the last tx-id.
 
-(def ^:dynamic *uow* nil)
-
 (defn meter-reg ^MeterRegistry []
   (let [meter-reg (SimpleMeterRegistry.)
         bind-metrics (fn [& metrics] (run! #(.bindTo % meter-reg) metrics))]
@@ -558,7 +583,8 @@
                    (.maximumExpectedValue (Duration/ofMinutes 2))
                    (.publishPercentiles (double-array percentiles))
                    (.register meter-reg))]
-    {:submit-tx-timer (timer "node.submit-tx")}))
+    {:submit-tx-timer (timer "node.submit-tx")
+     :query-timer (timer "node.query")}))
 
 (defn new-fn-gauge
   ([reg meter-name f] (new-fn-gauge reg meter-name f {}))
@@ -574,20 +600,62 @@
   (let [last-submitted (atom nil)
         last-completed (atom nil)
 
+        ;; todo hook into dropwizard perhaps
+        ;; and delete these?
         submit-counter (AtomicLong.)
         indexed-counter (AtomicLong.)
+        indexed-docs-counter (AtomicLong.)
+        indexed-bytes-counter (AtomicLong.)
+        indexed-av-counter (AtomicLong.)
 
-        {:keys [^Timer submit-tx-timer]}
+        _
+        (doto meter-reg
+          (.gauge "node.tx" ^Iterable [(Tag/of "event" "submitted")] submit-counter)
+          (.gauge "node.tx" ^Iterable [(Tag/of "event" "indexed")] indexed-counter)
+          (.gauge "node.indexed.docs" indexed-docs-counter)
+          (.gauge "node.indexed.bytes" indexed-bytes-counter)
+          (.gauge "node.indexed.av" indexed-av-counter))
+
+        {:keys [^Timer submit-tx-timer
+                ^Timer query-timer]}
         (install-proxy-node-meters! meter-reg)
 
         fn-gauge (partial new-fn-gauge meter-reg)
 
-        in-cb (fn [tx]
-                (reset! last-completed tx)
-                (.getAndIncrement indexed-counter)
-                nil)
+        on-indexed
+        (fn [{:keys [submitted-tx, doc-ids, av-count, bytes-indexed] :as event}]
+          (reset! last-completed submitted-tx)
+          (when (seq doc-ids)
+            (.getAndAdd indexed-docs-counter (count doc-ids))
+            (.getAndAdd indexed-av-counter (long av-count))
+            (.getAndAdd indexed-bytes-counter (long bytes-indexed)))
+          (.getAndIncrement indexed-counter)
+          nil)
 
-        listener (xt/listen node {::xt/event-type ::xt/indexed-tx} in-cb)
+        on-indexed-listener
+        (bus/listen (:bus node) {::xt/event-types #{:xtdb.tx/indexed-tx}} on-indexed)
+
+        on-query
+        (let [st (atom {})
+              start
+              (fn [query-id] (swap! st assoc query-id (Timer/start)))
+              stop
+              (fn [query-id]
+                (.stop ^Timer$Sample (@st query-id) query-timer)
+                (swap! st dissoc query-id))]
+          (fn [{:xtdb.query/keys [query-id]
+                ::xt/keys [event-type]}]
+            (if (identical? :xtdb.query/submitted-query event-type)
+              (start query-id)
+              (stop query-id))))
+
+        on-query-events
+        #{:xtdb.query/submitted-query
+          :xtdb.query/failed-query
+          :xtdb.query/completed-query}
+
+        on-query-listener
+        (bus/listen (:bus node) {::xt/event-types on-query-events} on-query)
 
         compute-lag-nanos
         (fn []
@@ -597,19 +665,11 @@
                            completed-tx-time ::xt/tx-time} @last-completed]
                 (when (< completed-tx-id tx-id)
                   (* (long 1e6) (- ms (inst-ms completed-tx-time))))))
-            0))
+            0))]
 
-        compute-lag-count
-        (fn [] (- (.get submit-counter) (.get indexed-counter)))]
-
-    ;; todo gauge indexed count, transaction lag can be derived, lag can simply be the time measure
-    (fn-gauge "node.tx.lag.transactions" compute-lag-count {:unit "transactions"})
-    (fn-gauge "node.tx.lag.delay" (comp #(/ % 1e9) compute-lag-nanos) {:unit "seconds"})
-
+    (fn-gauge "node.tx.lag" (comp #(/ % 1e9) compute-lag-nanos) {:unit "seconds"})
     (fn-gauge "node.kv.keys" #(:xtdb.kv/estimate-num-keys (xt/status node) 0) {:unit "count"})
     (fn-gauge "node.kv.size" #(:xtdb.kv/size (xt/status node) 0) {:unit "bytes"})
-
-
 
     (reify xt/PXtdb
       (status [_] (xt/status node))
@@ -644,7 +704,9 @@
       (open-db [_] (xt/open-db node))
       (open-db [_ valid-time-or-basis] (xt/open-db node valid-time-or-basis))
       Closeable
-      (close [_] (.close listener)))))
+      (close [_]
+        (.close on-query-listener)
+        (.close on-indexed-listener)))))
 
 (defn setup [node benchmark]
   (let [{:keys [loaders, fns]} benchmark
@@ -686,6 +748,27 @@
        :custom-state (into {} custom-state)
        :benchmark benchmark
        :seed seed})))
+
+(defn get-system-info
+  "Returns data about the hardware / OS running this JVM."
+  []
+  (let [si (SystemInfo.)
+        os (.getOperatingSystem si)
+        os-version (.getVersionInfo os)
+        os-codename (.getCodeName os-version)
+        os-version-number (.getVersion os-version)
+        arch (System/getProperty "os.arch")
+        hardware (.getHardware si)
+        cpu (.getProcessor hardware)
+        cpu-identifier (.getProcessorIdentifier cpu)
+        cpu-name (.getName cpu-identifier)
+        cpu-core-count (.getPhysicalProcessorCount cpu)
+        cpu-max-freq (.getMaxFreq cpu)
+        ram (.getMemory hardware)]
+    {:arch arch
+     :os (str/join " " (remove str/blank? [(.getFamily os) os-codename os-version-number]))
+     :memory (format "%sGB" (/ (long (.getTotal ram)) (* 1024 1024 1024)))
+     :cpu (format "%s, %s cores, %.2fGHZ max" cpu-name cpu-core-count (double (/ cpu-max-freq 1e9)))}))
 
 (defn run
   [{:keys [node,
@@ -799,8 +882,7 @@
               (try
                 (when-some [{:keys [uow-name, ^AtomicLong counter, proc] :as uow} (think worker)]
                   (try
-                    (binding [*uow* uow]
-                      (proc worker))
+                    (proc worker)
                     (.incrementAndGet counter)
                     (catch InterruptedException _ (.interrupt thread))
                     (catch Throwable e
@@ -851,7 +933,10 @@
       (reset! run-time-nanos (- (System/nanoTime) @run-start-nanos)))
 
     (with-meta
-      {:duration @run-time-nanos
+      {:system (get-system-info)
+       :threads threads
+       :seed seed
+       :duration @run-time-nanos
        :metrics (summarize-metrics)
        :stats (:stats node-proxy)
        :rps (calc-rps (reduce + 0N (map #(.get (:counter %)) uow-defs)))
@@ -873,27 +958,6 @@
     (assert (and node domain-state custom-state))
     (->Worker node (Random.) domain-state custom-state (Clock/systemUTC))))
 
-(defn get-system-info
-  "Returns data about the hardware / OS running this JVM."
-  []
-  (let [si (SystemInfo.)
-        os (.getOperatingSystem si)
-        os-version (.getVersionInfo os)
-        os-codename (.getCodeName os-version)
-        os-version-number (.getVersion os-version)
-        arch (System/getProperty "os.arch")
-        hardware (.getHardware si)
-        cpu (.getProcessor hardware)
-        cpu-identifier (.getProcessorIdentifier cpu)
-        cpu-name (.getName cpu-identifier)
-        cpu-core-count (.getPhysicalProcessorCount cpu)
-        cpu-max-freq (.getMaxFreq cpu)
-        ram (.getMemory hardware)]
-    {:arch arch
-     :os (str/join " " (remove str/blank? [(.getFamily os) os-codename os-version-number]))
-     :memory (format "%sGB" (/ (long (.getTotal ram)) (* 1024 1024 1024)))
-     :cpu (format "%s, %s cores, %.2fGHZ max" cpu-name cpu-core-count (double (/ cpu-max-freq 1e9)))}))
-
 (defn bench [benchmark & {:keys [run-opts,
                                  node-opts],
                           :or {run-opts {}, node-opts {}}}]
@@ -902,8 +966,7 @@
     (log/info "Starting setup")
     (let [bench-state (setup node benchmark)]
       (log/info "Starting run")
-      (assoc (run (merge bench-state run-opts))
-        :system (get-system-info)))))
+      (run (merge bench-state run-opts)))))
 
 (defn rocks-opts []
   (let [kv (fn [] {:xtdb/module 'xtdb.rocksdb/->kv-store,
@@ -938,6 +1001,9 @@
 (defn find-transaction [rs name]
   (some #(when (= name (:name %)) %) (:transactions rs)))
 
+;; use vega to plot metrics for now
+;; works at repl, no servers needed
+;; if this approach takes of the time series data wants to be graphed in something like a shared prometheus / grafana during run
 (defn vega-plots [metric-data]
   (vec
     (for [[metric metric-data] (sort-by key (group-by :metric metric-data))]
@@ -1082,3 +1148,208 @@
                          :let [{:keys [metrics]} (normalize-time (report-map label))]
                          metric metrics]
                      (assoc metric :vs-label (str label))))}))
+
+(def script-example
+  {:benchmark `auction-mark/auction-mark
+   :duration "PT5M"
+   :configurations [{:title "Rocks"
+                     :version "master"
+                     :jvm :yum
+                     :ec2 "t2.medium"
+                     :node :rocks}]})
+
+(def benchmark-clj-file-source *file*)
+(def benchmark-clj-file-target (.getName (io/file benchmark-clj-file-source)))
+(def benchmark-ns (.getName *ns*))
+
+(def default-repository "git@github.com:xtdb/xtdb.git")
+
+(defn- build-io-fns
+  "Returns a set of fns for doing IO, running processes and stuff.
+
+  Captures common concerns for bench builds such as error handling, logging, cleanup so the scripts are less of a mess!
+
+  Returns a map of functions:
+
+  :sh - like clojure.java.shell/sh, returns a string out. Takes an optional map first instead of needing to splice options onto the end of the command args.
+     e.g (sh {:env {\"SOME_VAR\" \"42\"}} \"my\" \"command\" \"args\")
+  :cd - changes the default working directory
+  :log - like println
+  :home-file returns a file relative to the home dir
+  :temp-dir returns a tmp-dir for the given string key, creating it for the first call. "
+  []
+  (let [working-dir (atom nil)
+        cd (fn cd [dir-name] (println "  $ cd" (reset! working-dir (str dir-name))))
+        sh (fn sh [opts? & args]
+             (let [opts (when (map? opts?) opts?)
+                   args (if (map? opts?) args (cons opts? args))
+                   {:keys [dir, env]} opts
+                   _ (when dir (println "  dir:" dir))
+                   _ (doseq [[e] env] (println "  env:" e))
+                   command-str (str/join " " args)
+                   _ (println "  $" command-str)
+                   use-dir (or dir @working-dir)
+                   opts (update opts :env merge {"HOME" (System/getenv "HOME")
+                                                 "PATH" (System/getenv "PATH")})
+                   opts-to-sh (if use-dir (assoc opts :dir use-dir) opts)
+                   {:keys [exit, err, out]} (apply sh/sh (apply concat args opts-to-sh))]
+               (when-not (= 0 exit)
+                 (throw (ex-info (or (not-empty out) "Command failed")
+                                 {:command command-str
+                                  :exit exit
+                                  :out out
+                                  :err err})))
+               out))
+        log println]
+    {:cd cd
+     :log log
+     :sh sh
+     :home-file (partial io/file (System/getenv "HOME"))
+     :temp-dir (memoize (partial xio/create-tmpdir))}))
+
+(defn build-xtdb-artifacts-if-needed [repository ref-spec]
+  (let [{:keys [cd, log, sh, home-file, temp-dir]} (build-io-fns)
+        xt-sha (first (str/split (sh "git" "ls-remote" default-repository ref-spec) #"\t"))
+        xt-version-default (str "bench-" xt-sha)
+        xt-core-m2-location-default (home-file ".m2" "repository" "com" "xtdb" "xtdb-core" xt-version-default)
+        xt-core-m2-location-if-ref-spec-a-release (home-file ".m2" "repository" "com" "xtdb" "xtdb-core" ref-spec)
+
+        xt-core-m2-location
+        (if (.exists xt-core-m2-location-if-ref-spec-a-release)
+          xt-core-m2-location-if-ref-spec-a-release
+          xt-core-m2-location-default)
+
+        xt-version (.getName xt-core-m2-location)
+        xt-core-m2-exists-already (.exists xt-core-m2-location)]
+
+    (when xt-core-m2-exists-already
+      (log "Using ~/.m2 xtdb artifacts for" xt-version))
+
+    (when-not xt-core-m2-exists-already
+      (let [tmp-dir (temp-dir "benchmark-xtdb")]
+        (log "Could not find xtdb artifacts, building from source")
+        (cd tmp-dir)
+        (log "Fetching xtdb ref" ref-spec "from" repository)
+        (sh "git" "init")
+        (sh "git" "remote" "add" "origin" repository)
+        (sh "git" "fetch" "origin" "--depth" "1" xt-sha)
+        (sh "git" "checkout" xt-sha)
+        (log "Installing jars for build")
+        (sh
+          {:env {"XTDB_VERSION" xt-version}}
+          "sh" "lein-sub" "install")
+        (.delete tmp-dir)))
+
+    {:xt-version xt-version
+     :git-repository repository
+     :git-ref ref-spec
+     :git-sha xt-sha}))
+
+;; delete once happy
+(defonce tmp-artifacts (build-xtdb-artifacts-if-needed default-repository "1.21.0"))
+
+(defn module-deps [sut]
+  (let [{:keys [index, doc, log]} sut
+        deps {:rocks [['com.xtdb/xtdb-rocksdb]]
+              :lmdb [['com.xtdb/xtdb-lmdb]]
+              :jdbc [['com.xtdb/xtdb-jdbc]]
+              :kafka [['com.xtdb/xtdb-kafka]]}]
+    (mapcat deps [index doc log])))
+
+(def bench-main-sym (symbol (str "bench.main")))
+(def bench-main-file (str "bench/main.clj"))
+(def benchmark-main-sym (symbol (str benchmark-ns "/-main")))
+
+(defn -main [& args]
+
+  ;; load benchmark options from 'place' (maybe url/s3) e.g s3://?
+
+  ;; run benchmark for max duration
+
+  ;; when done write output to 'place'
+
+  ;; unhappy paths:
+
+  ;; deps not installed or wrong (e.g java)
+  ;; bad java opts
+  ;; bad benchmark config
+  ;; benchmark definition missing or not as expected
+  ;; crash during setup
+  ;; crash during bench
+  ;; takes too long
+  ;; segfault/jvm exit
+
+  ;; during run reporting options
+  ;; log (cldwatch)
+  ;; wrapping shell script (to watch for jvm dying)
+  ;; write to s3
+  ;; slack
+  ;; live metrics to cloudwatch, graphite or grafana - as we go?
+
+  ;; finish reporting
+  ;; report file written to directory (with fat samples)
+
+  ;; reporting structure
+  ;; s3://$$$/xtdb-benchmarks/YYYY-MM-DD/HH-MM-SS-MS/definition.edn
+
+  ;; relative s3 paths for each sut/run (ordinals)
+  ;; /config/0/sut.jar
+  ;; /config/0/result.edn
+
+  ;; merged results
+  ;; /results.edn
+
+  ;;
+
+
+  )
+
+(def bench-main-content
+  (->> [(pr-str (list 'ns bench-main-sym))
+        ""
+        (pr-str
+          (list 'defn '-main '[& args]
+                (list 'requiring-resolve (list 'quote benchmark-main-sym))))]
+       (str/join "\n")))
+
+(defn lein-project
+  [{:keys [xtdb-artifacts, sut]}]
+  (let [{:keys [xt-version, git-sha]} xtdb-artifacts
+        project-name (str "xtdb-bench-" git-sha)]
+    {:project-name project-name
+     :sut sut
+     :project
+     (list 'defproject (symbol project-name) "0"
+           :aot [(symbol (name bench-main-sym) "-main")]
+           :dependencies
+           (vec (concat
+                  '[[org.clojure/clojure "1.11.1"]]
+
+                  ;; re-use bench project or externalise
+                  ;; a dep for bench deps themselves
+                  ;; to avoid writing these in two places
+                  '[[org.clojure/tools.logging "1.2.4"]
+                    [org.clojure/data.json "2.4.0"]
+                    [ch.qos.logback/logback-classic "1.2.11"]
+                    [ch.qos.logback/logback-core "1.2.11"]
+                    [io.micrometer/micrometer-core "1.9.5"]
+                    [com.github.oshi/oshi-core "6.3.0"]
+                    [pro.juxt.clojars-mirrors.hiccup/hiccup "2.0.0-alpha2"]
+                    [com.google.guava/guava "30.1.1-jre"]]
+
+                  ;; core xtdb dependencies
+                  [['com.xtdb/xtdb-core xt-version]]
+
+                  ;; module xtdb dependencies
+                  (for [[nm ver :as dep] (module-deps sut)]
+                    (if ver dep [nm xt-version])))))}))
+
+(defn run-script [script]
+  (let [{:keys [benchmark
+                duration
+                configurations]} script
+        bmark (requiring-resolve benchmark)
+        duration (Duration/parse duration)
+        run-id (str (System/currentTimeMillis) "-" (LocalDate/now))]
+
+    ))
