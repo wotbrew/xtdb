@@ -3,7 +3,10 @@ Description: "Infra for running auction mark on a throwaway amazon-linux ec2 pee
 Parameters:
   EbsOptimised:
     Type: String
-    Default: true
+    Default: false
+  Ami:
+    Type: String
+    Default: ami-0ee415e1b8b71305f
   InstanceType:
     Type: String
     Default: m1.small
@@ -27,16 +30,21 @@ Resources:
     Type: AWS::EC2::Instance
     Properties:
       EbsOptimized: !Ref EbsOptimised
-      ImageId: ""
+      ImageId: !Ref Ami
       InstanceType: !Ref InstanceType
-      Tags: [benchmark, !BenchmarkId, !Ref SutId]
-      BlockDeviceMappings:
-        # todo check path of root device on new new ami
-        - DeviceName: /dev/xvda/
-          Ebs:
-            VolumeType: !Ref VolumeType
-            VolumeSize: !Ref VolumeSize
-            DeleteOnTermination: true
+      Tags:
+        - Key: benchmark
+          Value: !Ref BenchmarkId
+        - Key: sut
+          Value: !Ref SutId
+#
+#      BlockDeviceMappings:
+#        # todo check path of root device on new new ami
+#        - DeviceName: /dev/xvda
+#          Ebs:
+#            VolumeType: !Ref VolumeType
+#            VolumeSize: !Ref VolumeSize
+#            DeleteOnTermination: true
 
       # todo get script + uberjar + jvm + whatever the hell else you need?
       # use SutId to fetch amazon-linux2 init script from s3? sec, no networking or vpc - we good?!

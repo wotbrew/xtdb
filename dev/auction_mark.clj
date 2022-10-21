@@ -8,8 +8,8 @@
             [clojure.data.json :as json]
             [xtdb.bus :as bus]
             [clojure.java.shell :as sh])
-  (:import (java.time Instant Clock Duration LocalDate)
-           (java.util Random Comparator ArrayList)
+  (:import (java.time Instant Clock Duration LocalDate LocalDateTime ZoneId)
+           (java.util Random Comparator ArrayList UUID)
            (java.util.concurrent.atomic AtomicLong)
            (java.util.concurrent ConcurrentHashMap)
            (java.util.function Function Supplier)
@@ -19,7 +19,33 @@
            (io.micrometer.core.instrument.binder.jvm ClassLoaderMetrics JvmMemoryMetrics JvmGcMetrics JvmThreadMetrics JvmHeapPressureMetrics)
            (io.micrometer.core.instrument.binder.system ProcessorMetrics)
            (io.micrometer.core.instrument Meter Measurement MeterRegistry Timer Tag Gauge Timer$Sample)
-           (oshi SystemInfo)))
+           (oshi SystemInfo)
+           (java.time.format DateTimeFormatter)
+           (clojure.lang ExceptionInfo)))
+
+;; definitions
+;;
+;; benchmark
+;; A particular benchmark to run, no parameters, fully concretized as data
+;; this represents the 'code' that will run against the SUT
+;; remains indirect however, data not code, as it will form the basis of the test which must be saved remotely
+;; has a load stage, and a run stage.
+
+;; sut
+;; a particular applications, versions, and configuration that we are testing
+;; represented as an opaque object, protocol for stopping and sampling time series metrics. Assumed instrumentation.
+;; this is an object that is provided on evaluation into a worker/ctx during the bench run
+;; e.g an instrumented xt node
+
+;; bench-req
+;; a user request for a benchmark to be run, might run locally or across machines in the cloud
+
+;; test
+;; a 'baked' bench req, that is all dependencies realised such that the test can be evaluated against the
+;; environment
+;; it takes evaluation to derive a test from a bench-req (resolving sha's, building jars and projects)
+;; the test can be evaluated
+
 
 ;; plan
 ;; run-for-duration type oltp benchmarks
@@ -1200,10 +1226,17 @@
                                   :out out
                                   :err err})))
                out))
+        aws (fn [& args]
+              (apply sh "aws" (concat args
+                                      ["--output" "json"
+                                       ;; todo require explicit setup
+                                       "--region" "eu-west-1"
+                                       "--profile" "juxt"])))
         log println]
     {:cd cd
      :log log
      :sh sh
+     :aws aws
      :home-file (partial io/file (System/getenv "HOME"))
      :temp-dir (memoize (partial xio/create-tmpdir))}))
 
@@ -1301,7 +1334,6 @@
 
   ;;
 
-
   )
 
 (def bench-main-content
@@ -1313,11 +1345,14 @@
        (str/join "\n")))
 
 (defn lein-project
-  [{:keys [xtdb-artifacts, sut]}]
+  [{:keys [xtdb-artifacts, index, log, docs]}]
   (let [{:keys [xt-version, git-sha]} xtdb-artifacts
-        project-name (str "xtdb-bench-" git-sha)]
+        project-name (str "xtdb-bench-" git-sha)
+        module-deps {:rocks [['com.xtdb/xtdb-rocksdb]]
+                     :lmdb [['com.xtdb/xtdb-lmdb]]
+                     :jdbc [['com.xtdb/xtdb-jdbc]]
+                     :kafka [['com.xtdb/xtdb-kafka]]}]
     {:project-name project-name
-     :sut sut
      :project
      (list 'defproject (symbol project-name) "0"
            :aot [(symbol (name bench-main-sym) "-main")]
@@ -1341,7 +1376,7 @@
                   [['com.xtdb/xtdb-core xt-version]]
 
                   ;; module xtdb dependencies
-                  (for [[nm ver :as dep] (module-deps sut)]
+                  (for [[nm ver :as dep] (mapcat module-deps [index log docs])]
                     (if ver dep [nm xt-version])))))}))
 
 (defn run-script [script]
@@ -1351,5 +1386,186 @@
         bmark (requiring-resolve benchmark)
         duration (Duration/parse duration)
         run-id (str (System/currentTimeMillis) "-" (LocalDate/now))]
+
+    ))
+
+(def aws-resource-qualifier "auctionmark")
+(def aws-s3-bucket "xtdb-bench")
+(defn aws-s3-path [& parts] (str/join "/" parts))
+
+(defn ec2-stack-cli-input [{:keys [benchmark-id, sut-id]}]
+  {:pre [benchmark-id, sut-id]}
+  (let [stack-name (str/join "-" [aws-resource-qualifier benchmark-id sut-id])]
+    {"StackName" stack-name
+     "TemplateBody" (slurp (io/resource "auction_mark_cf.yml"))
+     "Parameters" (vec (for [[k, v] {"BenchmarkId" benchmark-id
+                                     "SutId" sut-id
+                                     "JarUrl" "not-yet"}]
+                         {"ParameterKey" k
+                          "ParameterValue" v}))
+     "OnFailure" "DELETE"
+     "Tags" (vec (for [[k v] {"BenchmarkId" benchmark-id
+                              "SutId" sut-id}]
+                   {"Key" k
+                    "Value" v}))}))
+
+(defn ec2-stack-create [stack]
+  (let [{:keys [aws]} (build-io-fns)]
+    (aws "cloudformation" "create-stack" "--cli-input-json" (json/write-str (ec2-stack-cli-input stack)))))
+
+(defn ec2-stack-ls []
+  (let [{:keys [aws]} (build-io-fns)]
+    (aws "cloudformation" "list-stacks"
+         "--stack-status-filter" "CREATE_COMPLETE"
+         "--query" (format "StackSummaries[?starts_with(StackName, `%s`)]" aws-resource-qualifier))))
+
+(defn ec2-stack-delete [stack-name]
+  (let [{:keys [aws]} (build-io-fns)]
+    (aws "cloudformation" "delete-stack" "--stack-name" stack-name)))
+
+(def example-ec2-run-def
+  {:benchmark :auctionmark
+   :duration "PT5M"
+   :vs [{:name "RocksDB"
+         :repo default-repository
+         :version "1.22.0"
+         :index :rocks
+         :docs :rocks
+         :log :rocks
+         :jre 17
+         :instance "m1.small"}
+        {:name "LMDB"
+         :repo default-repository
+         :version "1.22.0"
+         :index :lmdb
+         :docs :lmdb
+         :log :lmdb
+         :jre 17
+         :instance "m1.small"}]})
+
+(def ec2-amazon-linux-2-info
+  {:ami "ami-0ee415e1b8b71305f"
+   ;; package names of different jre's
+   :jre-packages {17 "java-17-amazon-corretto-headless"}})
+
+(defn cfn-template [{:keys [ami, jre-package, instance]}]
+  {"AWSTemplateFormatVersion" "2010-09-09"
+   "Description" "auction mark test"
+   "Resources" {"Runner" {"Type" "AWS::EC2::Instance"}
+                "Properties" {"ImageId" ami
+                              "InstanceType" instance}}})
+
+
+(defn ec2-stack-create-cli-input [{:keys [benchmark-id, sut-id] :as sut}]
+  {:pre [benchmark-id, sut-id]}
+  (let [stack-name (str/join "-" [aws-resource-qualifier benchmark-id sut-id])]
+    {"StackName" stack-name
+     "TemplateBody" (json/write-str (cfn-template sut))
+     "Parameters" []
+     "OnFailure" "DELETE"
+     "Tags" (vec (for [[k v] {"BenchmarkId" benchmark-id
+                              "SutId" sut-id}]
+                   {"Key" k "Value" v}))}))
+
+(defn ec2-run-manifest [{:keys [benchmark, duration, vs] :as benchmark-def}]
+  (let [now (Instant/now)
+        {:keys [log]} (build-io-fns)
+
+        ;; london time prefixing for humies
+        now-ldt (LocalDateTime/ofInstant now (ZoneId/of "Europe/London"))
+        now-unix-ms (.toEpochMilli now)
+
+        s3-ldt-pattern "YYYY/MM/dd"
+        s3-ldt-path (.format now-ldt (DateTimeFormatter/ofPattern s3-ldt-pattern))
+        s3-path (partial aws-s3-path (name benchmark) s3-ldt-path now-unix-ms)
+
+        benchmark-id (aws-s3-path (str "s3://" aws-s3-bucket) (s3-path))
+        ami "ami-0ee415e1b8b71305f"
+        jre-packages {17 "java-17-amazon-corretto-headless"}
+
+        _ (log "Manifest for" benchmark-id)
+        _ (log "XT Versions")
+        code-locs (set (map (juxt :repo :version) vs))
+        artifacts
+        (->> code-locs
+             (map (fn [[repo version]]
+                    (build-xtdb-artifacts-if-needed
+                      (or repo default-repository)
+                      (or version "master"))))
+             (zipmap code-locs))
+        runs (for [[i {:keys [name, repo, version, index, docs, log, jre, instance] :as sut
+                       :or {name ""
+                            index :rocks
+                            log :rocks
+                            docs :rocks
+                            jre 17
+                            instance "m1.small"}}]
+                   (map-indexed vector vs)
+                   :let [s3-path-sut (partial s3-path (str "sut" i))
+                         sut-id (str benchmark-id "/" "sut" i)]]
+               {:benchmark-id benchmark-id
+                :sut-id sut-id
+                ;; will contain the build map, sha, uberjar loc etc
+                :s3-build-key (s3-path-sut "build.edn")
+                ;; will contain the status map (updated by the ec2 node!)
+                :s3-run-key (s3-path-sut "status.edn")
+                ;; will contain the eventual run report
+                :s3-report-key (s3-path-sut "report.edn")
+                :duration duration
+                :instance instance
+                :label name
+                :ami ami
+                :packages [(jre-packages jre)]
+                :repo repo
+                :version version
+                :xtdb-artifacts (artifacts [repo version])
+                :index index
+                :docs docs
+                :logs log})]
+
+    {:benchmark-id benchmark-id
+     :benchmark-def benchmark-def
+     :s3-bucket aws-s3-bucket
+     ;; will contain the input map
+     :s3-def-key (s3-path "def.edn")
+     ;; will contain this map
+     :s3-manifest-key (s3-path "manifest.edn")
+     ;; run data for each system-under-test
+     :runs (vec runs)}))
+
+(defn ec2-run-setup [manifest]
+  (let [{:keys [benchmark-id,
+                benchmark-def,
+                runs,
+                s3-def-key
+                s3-manifest-key]} manifest
+        {:keys [aws, log]} (build-io-fns)
+
+        s3-key-used
+        #(try
+           (aws "s3api" "head-object" "--bucket" aws-s3-bucket "--key" %)
+           false
+           (catch ExceptionInfo ex (str/starts-with? (:err (ex-data ex) "") "An error occurred (404)")))
+
+        s3-key-not-used (complement s3-key-used)
+        ]
+
+    (log "Setup" benchmark-id)
+
+    (doseq [{:keys [sut-id, repo, version, xtdb-artifacts] :as sut} runs]
+      (log "Building" sut-id)
+      (let [lein-proj (lein-project {:xtdb-artifacts xtdb-artifacts, :sut sut})
+            ]
+        ;; todo build lein proj into uberjar?
+
+        )
+      (log "Ok"))
+
+
+
+    (log "Testing that existing benchmark will not be clobbered")
+    (assert (s3-key-not-used s3-def-key))
+    (assert (s3-key-not-used s3-manifest-key))
+    (log "Ok")
 
     ))
