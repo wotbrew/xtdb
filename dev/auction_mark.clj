@@ -11,7 +11,7 @@
   (:import (java.time Instant Clock Duration LocalDate LocalDateTime ZoneId)
            (java.util Random Comparator ArrayList UUID)
            (java.util.concurrent.atomic AtomicLong)
-           (java.util.concurrent ConcurrentHashMap)
+           (java.util.concurrent ConcurrentHashMap Executors TimeUnit)
            (java.util.function Function Supplier)
            (com.google.common.collect MinMaxPriorityQueue)
            (java.io Closeable File)
@@ -28,8 +28,7 @@
 ;; benchmark
 ;; A particular benchmark to run, no parameters, fully concretized as data
 ;; this represents the 'code' that will run against the SUT
-;; remains indirect however, data not code, as it will form the basis of the test which must be saved remotely
-;; has a load stage, and a run stage.
+;; what is saved remotely is the arguments to a benchmark function, the function needs to be pure therefore.
 
 ;; sut
 ;; a particular applications, versions, and configuration that we are testing
@@ -74,7 +73,7 @@
 
 (set! *warn-on-reflection* false)
 
-(defrecord Worker [node random domain-state custom-state clock])
+(defrecord Worker [node random domain-state custom-state clock reports])
 
 (defn current-timestamp ^Instant [worker]
   (.instant ^Clock (:clock worker)))
@@ -748,6 +747,7 @@
            :random random,
            :domain-state domain-state
            :custom-state custom-state
+           :reports (atom [])
            :clock clock})]
 
     (log/info "Inserting transaction functions")
@@ -903,7 +903,8 @@
                                      :random random
                                      :domain-state domain-state
                                      :custom-state custom-state
-                                     :clock clock})]
+                                     :clock clock
+                                     :reports (atom [])})]
             (while (not (.isInterrupted thread))
               (try
                 (when-some [{:keys [uow-name, ^AtomicLong counter, proc] :as uow} (think worker)]
@@ -982,7 +983,7 @@
 (defn post-bench-worker [results]
   (let [{:keys [node, domain-state, custom-state]} (meta results)]
     (assert (and node domain-state custom-state))
-    (->Worker node (Random.) domain-state custom-state (Clock/systemUTC))))
+    (->Worker node (Random.) domain-state custom-state (Clock/systemUTC) (atom []))))
 
 (defn bench [benchmark & {:keys [run-opts,
                                  node-opts],
@@ -1240,9 +1241,12 @@
      :home-file (partial io/file (System/getenv "HOME"))
      :temp-dir (memoize (partial xio/create-tmpdir))}))
 
+(defn resolve-sha [repository ref-spec]
+  (first (str/split ((:sh (build-io-fns)) "git" "ls-remote" repository ref-spec) #"\t")))
+
 (defn build-xtdb-artifacts-if-needed [repository ref-spec]
   (let [{:keys [cd, log, sh, home-file, temp-dir]} (build-io-fns)
-        xt-sha (first (str/split (sh "git" "ls-remote" default-repository ref-spec) #"\t"))
+        xt-sha (resolve-sha repository ref-spec)
         xt-version-default (str "bench-" xt-sha)
         xt-core-m2-location-default (home-file ".m2" "repository" "com" "xtdb" "xtdb-core" xt-version-default)
         xt-core-m2-location-if-ref-spec-a-release (home-file ".m2" "repository" "com" "xtdb" "xtdb-core" ref-spec)
@@ -1569,3 +1573,369 @@
     (log "Ok")
 
     ))
+
+#_{:loaders
+   [[:f #'load-categories-tsv]
+    [:generator #'generate-region {:n 75}]
+    [:generator #'generate-category {:n 16908}]]
+
+   :fns
+   {:apply-seller-fee #'tx-fn-apply-seller-fee
+    :new-bid #'tx-fn-new-bid}
+
+   :tasks
+   [[:proc #'proc-new-user {:weight 0.5}]
+    [:proc #'proc-new-item {:weight 1.0}]
+    [:proc #'proc-get-item {:weight 12.0}]
+    [:proc #'proc-new-bid {:weight 2.0}]
+    [:job #'index-item-status-groups {:freq {:ratio 0.2}}]]}
+
+(defn generate [worker f n]
+  (let [doc-seq (repeatedly n (partial f worker))
+        partition-count 512]
+    (doseq [chunk (partition-all partition-count doc-seq)]
+      (xt/submit-tx (:node worker) (mapv (partial vector ::xt/put) chunk)))))
+
+(defn compile-benchmark [benchmark middleware]
+  (let [run-middleware (fn [task f] (middleware {:task task, :f f}))
+
+        lift-f (fn [f] (if (vector? f) #(apply (first f) % (rest f)) f))
+
+        await-threads
+        (fn [threads ^Duration wait]
+
+          (when-some [t (first threads)]
+            (.join t (.toMillis wait)))
+
+          ;; warn/alert?
+          (doseq [^Thread thread (filter #(.isAlive ^Thread %) threads)]
+            (.interrupt thread)))
+
+        compile-task
+        (fn compile-task [{:keys [t] :as task}]
+          (run-middleware task
+                          (case t
+                            :do
+                            (let [{:keys [tasks]} task]
+                              (let [fns (mapv compile-task tasks)]
+                                (fn run-do [worker]
+                                  (doseq [f fns]
+                                    (f worker)))))
+
+                            :call
+                            (let [{:keys [f]} task]
+                              (lift-f f))
+
+                            :pool
+                            (let [{:keys [^Duration duration
+                                          ^Duration think
+                                          ^Duration join-wait
+                                          thread-count
+                                          pooled-task]} task
+
+                                  think-ms (.toMillis (or think Duration/ZERO))
+                                  sleep (if (pos? think-ms) #(Thread/sleep think-ms) (constantly nil))
+                                  f (compile-task pooled-task)
+
+                                  thread-loop
+                                  (fn run-pool-thread-loop [worker]
+                                    (let [^Clock clock (:clock worker)]
+                                      (loop [wait-until (+ (.millis clock) (.toMillis duration))]
+                                        (f)
+                                        (when (< (.millis clock) wait-until)
+                                          (sleep)
+                                          (recur wait-until)))))
+
+                                  start-thread
+                                  (fn [root-worker i]
+                                    (let [worker (assoc root-worker :random (Random. (.nextLong ^Random (:random root-worker))))]
+                                      (doto (Thread. ^Runnable (fn [] (thread-loop worker)))
+                                        (.start))))]
+
+                              (fn run-pool [worker]
+                                (let [running-threads (mapv #(start-thread worker %) (range thread-count))]
+                                  (await-threads running-threads (.plus duration join-wait)))))
+
+                            :concurrently
+                            (let [{:keys [^Duration duration,
+                                          ^Duration join-wait,
+                                          thread-tasks]} task
+
+                                  thread-task-fns (mapv compile-task thread-tasks)
+                                  start-thread
+                                  (fn [root-worker i f]
+                                    (let [worker (assoc root-worker :random (Random. (.nextLong ^Random (:random root-worker))))]
+                                      (doto (Thread. ^Runnable (fn [] (f worker)))
+                                        (.start))))]
+                              (fn run-concurrently [worker]
+                                (let [running-threads (vec (map-indexed #(start-thread worker %1 %2) thread-task-fns))]
+                                  (await-threads running-threads (.plus duration join-wait)))))
+
+                            :pick-weighted
+                            (let [{:keys [choices]} task
+                                  sample-fn (weighted-sample-fn (mapv (fn [[task weight]] [(compile-task task) weight]) choices))]
+                              (if (empty? choices)
+                                (constantly nil)
+                                (fn run-pick-weighted [worker]
+                                  (let [[f] (sample-fn worker)]
+                                    (f worker)))))
+
+                            :freq-job
+                            (let [{:keys [^Duration duration,
+                                          ^Duration freq,
+                                          job-task]} task
+                                  f (compile-task job-task)
+                                  duration-ms (.toMillis (or duration Duration/ZERO))
+                                  freq-ms (.toMillis (or freq Duration/ZERO))
+                                  sleep (if (pos? freq-ms) #(Thread/sleep freq-ms) (constantly nil))]
+                              (fn run-freq-job [worker]
+                                (loop [wait-until (+ (.millis ^Clock (:clock worker)) duration-ms)]
+                                  (f)
+                                  (when (< (.millis (:clock worker)) wait-until)
+                                    (sleep)
+                                    (recur wait-until))))))))
+
+        seed (:seed benchmark 0)
+        fns (mapv compile-task (:tasks benchmark))]
+    (fn run-benchmark [sut]
+      (let [clock (Clock/systemUTC)
+            domain-state (ConcurrentHashMap.)
+            custom-state (ConcurrentHashMap.)
+            root-random (Random. seed)
+            reports (atom [])
+            worker (->Worker sut root-random domain-state custom-state clock reports)]
+        (doseq [f fns]
+          (f worker))
+        @reports))))
+
+(defn install-tx-fns [worker fns]
+  (->> (for [[id fn-def] fns]
+         [::xt/put {:xt/id id, :xt/fn fn-def}])
+       (xt/submit-tx (:node worker))))
+
+(defn add-report [worker report]
+  (swap! (:reports worker) conj report))
+
+(def ^:dynamic ^:private *meter-reg* nil)
+
+(defn wrap-metrics []
+  (let [instrument-f
+        (fn [k f]
+          (let [timer-delay
+                (delay
+                  (fn []
+                    (when *meter-reg*
+                      (-> (Timer/builder (str "auctionmark." (name k)))
+                          (.publishPercentiles (double-array percentiles))
+                          (.maximumExpectedValue (Duration/ofHours 8))
+                          (.minimumExpectedValue (Duration/ofNanos 1))
+                          (.register *meter-reg*)))))]
+            (fn instrumented-transaction [worker]
+              (if-some [^Timer timer @timer-delay]
+                (.recordCallable timer ^Callable (fn [] (f worker)))
+                (f worker)))))
+
+        instrument-stage
+        (fn [k f]
+          (fn instrumented-stage [worker]
+            (let [reg (meter-reg)
+                  sampler (meter-sampler reg)
+                  executor (Executors/newSingleThreadScheduledExecutor)
+                  sample-freq 1000]
+              (.scheduleAtFixedRate
+                executor
+                ^Runnable sampler
+                0
+                sample-freq
+                TimeUnit/MILLISECONDS)
+              (try
+                (f worker)
+                (add-report worker {:stage k, :metrics (sampler :summarize)})
+                (finally
+                  (.shutdownNow executor))))))]
+    (fn [{:keys [task, f]}]
+      (let [{:keys [stage, transaction]} task]
+        {:task task
+         :f (cond
+              stage (instrument-stage stage f)
+              transaction (instrument-f transaction f)
+              :else f)}))))
+
+(defn auctionmark2 [{:keys [seed,
+                            threads,
+                            duration]
+                     :or {seed 0,
+                          threads 8,
+                          duration "PT30S"}}]
+  (let [duration (Duration/parse duration)]
+    {:title "Auction Mark OLTP"
+     :seed seed
+     :tasks
+     [{:t :do
+       :stage :load
+       :tasks [{:t :call :f [install-tx-fns {:apply-seller-fee tx-fn-apply-seller-fee, :new-bid tx-fn-new-bid}]}
+               {:t :call :f load-categories-tsv}
+               {:t :call :f [generate generate-region 75]}
+               {:t :call :f [generate generate-category 16908]}]}
+      {:t :concurrently
+       :stage :oltp
+       :duration duration
+       :join-wait (Duration/ofSeconds 5)
+       :thread-tasks [{:t :pool
+                       :duration duration
+                       :join-wait (Duration/ofSeconds 5)
+                       :thread-count threads
+                       :think Duration/ZERO
+                       :pooled-task {:t :pick-weighted
+                                     :choices [[{:t :call, :transaction :get-item :f proc-get-item} 12.0]
+                                               [{:t :call, :transaction :new-user :f proc-new-user} 0.5]
+                                               [{:t :call, :transaction :new-item :f proc-new-item} 1.0]
+                                               [{:t :call, :transaction :new-bid :f proc-new-bid} 2.0]]}}
+                      {:t :freq-job
+                       :duration duration
+                       :freq (Duration/ofMillis (* 0.2 (.toMillis duration)))
+                       :job-task {:t :call, :ancillary :index-item-status-groups, :f index-item-status-groups}}]}]}))
+
+(defn quick-run [benchmark node-opts]
+  (let [f (compile-benchmark benchmark (wrap-metrics))]
+    (with-open [sut (xt/start-node node-opts)]
+      (f sut))))
+
+(def bench-req-example
+  {:title "Rocks"
+   :t :auctionmark,
+   :arg {:duration "PT30M", :thread-count 8}
+   :env {:t :ec2, :instance "m1.small"}
+   :sut {:t :xtdb,
+         :version "1.22.0"
+         :index :rocks
+         :log :rocks
+         :docs :rocks}})
+
+(defn timestamp-path [epoch-ms]
+  (let [ldt (LocalDateTime/ofInstant (Instant/ofEpochMilli epoch-ms) (ZoneId/of "Europe/London"))]
+    (.format ldt (DateTimeFormatter/ofPattern "YYYY/MM/dd/HH-mm-ss-SS"))))
+
+(defn bench-path [epoch-ms, filename]
+  ;; unencoded filename but who cares right now
+  (str "b2/" (timestamp-path epoch-ms) "/" filename))
+
+(defn bench-loc-fn [env epoch-ms]
+  (case (:t env)
+    :local
+    (fn local-path [filename]
+      {:t :local,
+       :file (.getAbsolutePath (io/file "/tmp" (bench-path epoch-ms filename)))})
+    :ec2
+    (fn ec2-path [filename]
+      {:t :s3,
+       :bucket "xtdb-bench"
+       :key (bench-path epoch-ms filename)})))
+
+(defn resolve-env [env sut]
+  (case (:t env)
+    :local env
+    :ec2
+    (let [{:keys [instance,
+                  ami]
+           :or {instance "m1.small"
+                ami "ami-0ee415e1b8b71305f"}} env
+          {:keys [jre, jar]} sut
+
+          jre-package
+          (case [(:t jre) (:version jre)]
+            [:corretto 17] "java-17-amazon-corretto-headless")
+
+          jar-path (case (:t jar) :s3 (str "s3://" (:bucket jar) "/" (:key jar)))]
+      (merge
+        env
+        {:t :ec2
+         :instance instance
+         :ami ami
+         :packages [jre-package, "awscli"]
+         :script [["aws" "cp" jar-path "sut.jar"] ["java" "-jar" "sut.jar"]]}))))
+
+(defn resolve-sut [sut loc-fn]
+  (case (:t sut)
+    :xtdb
+    (let [{:keys [repository
+                  version
+                  index
+                  docs
+                  log
+                  jre]
+           :or {repository "git@github.com:xtdb/xtdb.git"
+                version "master"
+                index :rocks
+                docs :rocks
+                log :rocks
+                jre {:t :corretto, :version 17}}} sut
+          sha (resolve-sha repository version)]
+      (merge
+        sut
+        {:repository repository
+         :version version
+         :index index
+         :docs docs
+         :log log
+         :sha sha
+         :jre jre
+         :jar (loc-fn "sut.jar")}))))
+
+(defn resolve-manifest
+  [req]
+  (let [{:keys [env, sut]} req
+        epoch-ms (System/currentTimeMillis)
+        loc-fn (bench-loc-fn env epoch-ms)
+        resolved-sut (resolve-sut sut loc-fn)
+        resolved-env (resolve-env env resolved-sut)]
+    (merge
+      req
+      {:epoch-ms epoch-ms
+       :manifest (loc-fn "manifest.edn")
+       :report (loc-fn "report.edn")
+       :status (loc-fn "status.edn")
+       :env resolved-env
+       :sut resolved-sut})))
+
+(def bench-manifest-example
+  "A bench request is turned into a manifest, in which any ambiguous references (such as tags, versions, packages)
+  are resolved into something less ambiguous. All paths and strings that need to be known are hopefully
+  captured at some point in time"
+  {:title "Rocks"
+   :t :auctionmark
+   :epoch-ms 166661643559
+
+   :manifest {:t :s3, :bucket "xtdb-bench", :key "b2/2022/10/24/13-54-03-433/manifest.edn"}
+   :report {:t :s3, :bucket "xtdb-bench", :key "b2/2022/10/24/13-54-03-433/report.edn"}
+   :status {:t :s3, :bucket "xtdb-bench", :key "b2/2022/10/24/13-54-03-433/status.edn"}
+
+   :arg {:duration "PT30M", :thread-count 8}
+
+   :env
+   {:t :ec2,
+    :instance "m1.small",
+    :ami "ami-0ee415e1b8b71305f"
+    :packages ["java-17-amazon-corretto-headless", "awscli"]
+    :script ["aws cp s3://xtdb-bench/b2/2022/10/24/13-54-03-433/sut.jar sut.jar" "java -jar sut.jar"]}
+
+   :sut
+   {:t :xtdb,
+    :version "1.22.0",
+    :sha "3acfe756058a70dd4186c38430a36f5035a9d21c"
+    :jar {:t :s3, :bucket "xtdb-bench", :key "b2/2022/10/24/13-54-03-433/sut.jar"}
+    :index :rocks,
+    :log :rocks,
+    :docs :rocks
+    :jre {:t :corretto, :version 17}}})
+
+(def test-example
+  {:vs [{:title "Rocks"
+         :runner {:t :ec2, :instance "m1.small"}
+         :sut {:t :jar,
+               :jre 17
+               :uri "s3://....",
+               :args {}}}
+        {:title "LMDB"
+         :runner {}
+         :sut {}}]})
