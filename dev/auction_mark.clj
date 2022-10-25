@@ -1348,39 +1348,72 @@
                 (list 'requiring-resolve (list 'quote benchmark-main-sym))))]
        (str/join "\n")))
 
+(defn sut-mvn-deps [{:keys [sha, index, log, docs]}]
+  (let [module-deps {:rocks [['com.xtdb/xtdb-rocksdb]]
+                     :lmdb [['com.xtdb/xtdb-lmdb]]
+                     :jdbc [['com.xtdb/xtdb-jdbc]]
+                     :kafka [['com.xtdb/xtdb-kafka]]}]
+    (vec (concat
+           '[[org.clojure/clojure "1.11.1"]]
+
+           ;; re-use bench project or externalise
+           ;; a dep for bench deps themselves
+           ;; to avoid writing these in two places
+           '[[org.clojure/tools.logging "1.2.4"]
+             [org.clojure/data.json "2.4.0"]
+             [ch.qos.logback/logback-classic "1.2.11"]
+             [ch.qos.logback/logback-core "1.2.11"]
+             [io.micrometer/micrometer-core "1.9.5"]
+             [com.github.oshi/oshi-core "6.3.0"]
+             [pro.juxt.clojars-mirrors.hiccup/hiccup "2.0.0-alpha2"]
+             [com.google.guava/guava "30.1.1-jre"]]
+
+           ;; core xtdb dependencies
+           [['com.xtdb/xtdb-core sha]]
+
+           ;; module xtdb dependencies
+           (for [[nm ver :as dep] (mapcat module-deps [index log docs])]
+             (if ver dep [nm sha]))))))
+
+(defn sut-sources []
+  {"src/bench2.clj" (slurp benchmark-clj-file-source)
+   "src/bench2/main.clj" "(ns bench2.main)"})
+
 (defn lein-project
-  [{:keys [xt-version, index, log, docs]}]
-  (let [project-name (str/join "-" (map name [xt-version "bench" index docs log]))
+  [{:keys [sha, index, log, docs] :as sut}]
+  (let [project-name (str/join "-" (map name [sha "bench" index docs log]))
         module-deps {:rocks [['com.xtdb/xtdb-rocksdb]]
                      :lmdb [['com.xtdb/xtdb-lmdb]]
                      :jdbc [['com.xtdb/xtdb-jdbc]]
                      :kafka [['com.xtdb/xtdb-kafka]]}]
-    {:project-name project-name
-     :project
-     (list 'defproject (symbol project-name) "0"
-           :aot ['bench.main]
-           :dependencies
-           (vec (concat
-                  '[[org.clojure/clojure "1.11.1"]]
+    {"src/bench/main.clj" "(ns bench.main) (defn -main [& args] (apply (requiring-resolve 'auctionmark/-main) args)"
+     "src/auctionmark.clj" (slurp benchmark-clj-file-source)
+     "project.clj"
+     (pr-str
+       (list 'defproject (symbol project-name) "0"
+             :aot [bench-main-sym]
+             :dependencies
+             (vec (concat
+                    '[[org.clojure/clojure "1.11.1"]]
 
-                  ;; re-use bench project or externalise
-                  ;; a dep for bench deps themselves
-                  ;; to avoid writing these in two places
-                  '[[org.clojure/tools.logging "1.2.4"]
-                    [org.clojure/data.json "2.4.0"]
-                    [ch.qos.logback/logback-classic "1.2.11"]
-                    [ch.qos.logback/logback-core "1.2.11"]
-                    [io.micrometer/micrometer-core "1.9.5"]
-                    [com.github.oshi/oshi-core "6.3.0"]
-                    [pro.juxt.clojars-mirrors.hiccup/hiccup "2.0.0-alpha2"]
-                    [com.google.guava/guava "30.1.1-jre"]]
+                    ;; re-use bench project or externalise
+                    ;; a dep for bench deps themselves
+                    ;; to avoid writing these in two places
+                    '[[org.clojure/tools.logging "1.2.4"]
+                      [org.clojure/data.json "2.4.0"]
+                      [ch.qos.logback/logback-classic "1.2.11"]
+                      [ch.qos.logback/logback-core "1.2.11"]
+                      [io.micrometer/micrometer-core "1.9.5"]
+                      [com.github.oshi/oshi-core "6.3.0"]
+                      [pro.juxt.clojars-mirrors.hiccup/hiccup "2.0.0-alpha2"]
+                      [com.google.guava/guava "30.1.1-jre"]]
 
-                  ;; core xtdb dependencies
-                  [['com.xtdb/xtdb-core xt-version]]
+                    ;; core xtdb dependencies
+                    [['com.xtdb/xtdb-core sha]]
 
-                  ;; module xtdb dependencies
-                  (for [[nm ver :as dep] (mapcat module-deps [index log docs])]
-                    (if ver dep [nm xt-version])))))}))
+                    ;; module xtdb dependencies
+                    (for [[nm ver :as dep] (mapcat module-deps [index log docs])]
+                      (if ver dep [nm sha]))))))}))
 
 (defn run-script [script]
   (let [{:keys [benchmark
