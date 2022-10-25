@@ -1349,9 +1349,8 @@
        (str/join "\n")))
 
 (defn lein-project
-  [{:keys [xtdb-artifacts, index, log, docs]}]
-  (let [{:keys [xt-version, git-sha]} xtdb-artifacts
-        project-name (str "xtdb-bench-" git-sha)
+  [{:keys [xt-version, index, log, docs]}]
+  (let [project-name (str/join "-" (map name [xt-version "bench" index docs log]))
         module-deps {:rocks [['com.xtdb/xtdb-rocksdb]]
                      :lmdb [['com.xtdb/xtdb-lmdb]]
                      :jdbc [['com.xtdb/xtdb-jdbc]]
@@ -1359,7 +1358,7 @@
     {:project-name project-name
      :project
      (list 'defproject (symbol project-name) "0"
-           :aot [(symbol (name bench-main-sym) "-main")]
+           :aot ['bench.main]
            :dependencies
            (vec (concat
                   '[[org.clojure/clojure "1.11.1"]]
@@ -1824,7 +1823,8 @@
   (case (:t env)
     :local
     (fn local-path [filename]
-      {:t :local,
+      {:t :file,
+       ;; todo tmp-dir prop
        :file (.getAbsolutePath (io/file "/tmp" (bench-path epoch-ms filename)))})
     :ec2
     (fn ec2-path [filename]
@@ -1832,7 +1832,7 @@
        :bucket "xtdb-bench"
        :key (bench-path epoch-ms filename)})))
 
-(defn resolve-env [env sut]
+(defn resolve-env [env sut manifest-loc]
   (case (:t env)
     :local env
     :ec2
@@ -1853,7 +1853,8 @@
          :instance instance
          :ami ami
          :packages [jre-package, "awscli"]
-         :script [["aws" "cp" jar-path "sut.jar"] ["java" "-jar" "sut.jar"]]}))))
+         :script [["aws" "cp" jar-path "sut.jar"]
+                  ["java" "-jar" "sut.jar" manifest-loc]]}))))
 
 (defn resolve-sut [sut loc-fn]
   (case (:t sut)
@@ -1882,21 +1883,68 @@
          :jre jre
          :jar (loc-fn "sut.jar")}))))
 
-(defn resolve-manifest
+(defn resolve-req
   [req]
   (let [{:keys [env, sut]} req
         epoch-ms (System/currentTimeMillis)
         loc-fn (bench-loc-fn env epoch-ms)
         resolved-sut (resolve-sut sut loc-fn)
-        resolved-env (resolve-env env resolved-sut)]
+        manifest-loc (loc-fn "manifest.edn")
+        resolved-env (resolve-env env resolved-sut manifest-loc)]
     (merge
       req
       {:epoch-ms epoch-ms
-       :manifest (loc-fn "manifest.edn")
+       :manifest manifest-loc
        :report (loc-fn "report.edn")
        :status (loc-fn "status.edn")
        :env resolved-env
        :sut resolved-sut})))
+
+(defn build-sut-artifact-if-needed [{:keys [repository, sha, index, docs, log]}]
+  (let [{:keys [xt-version]} (build-xtdb-artifacts-if-needed repository sha)
+        {:keys [project-name, project]} (lein-project {:xt-version xt-version, :index index, :docs docs, :log log})
+        project-dir (io/file "/tmp" "b2" "projects" project-name)
+        {:keys [cd, sh]} (build-io-fns)]
+    (cd project-dir)
+    (spit (io/file project-dir "project.clj") (pr-str project))
+    ;; todo cp self-src and main shim
+    (sh "lein uberjar")
+    (io/file project-dir "target" (str project-name "-standalone.jar"))))
+
+(defn fufil-sut-requirements [resolved-sut]
+  (let [{:keys [t, repository, sha, index, docs, log]} resolved-sut
+        _ (assert (= :xtdb t))
+        {:keys [xt-version]} (build-xtdb-artifacts-if-needed repository sha)
+        {:keys [project-name, project]} (lein-project (assoc resolved-sut :xt-version xt-version))]
+
+    ))
+
+(defn fulfil-manifest [manifest]
+  (let [{:keys [log]} (build-io-fns)
+        loc-str (fn [loc]
+                  (case (:t loc)
+                    :s3 (str "s3://" (:bucket loc) "/" (:key loc))
+                    :file (str (:file loc))))
+        {self-loc :manifest
+         :keys [env, sut]} manifest]
+
+    ;; only core1 for now
+    (assert (= :xtdb (:t sut)))
+
+    (log "Fulfiling manifest" (loc-str) self-loc)
+    (log "Building artifacts")
+    (let [{:keys [xt-version]} (build-xtdb-artifacts-if-needed (:repository sut) (:sha sut))
+          lein-prj (lein-project
+                     {:xt-version xt-version,
+                      :index (:index sut)
+                      :docs (:docs sut)
+                      :log (:log sut)})]
+
+      )
+
+    (log "Uploading artifacts")
+
+    ))
 
 (def bench-manifest-example
   "A bench request is turned into a manifest, in which any ambiguous references (such as tags, versions, packages)
@@ -1928,14 +1976,3 @@
     :log :rocks,
     :docs :rocks
     :jre {:t :corretto, :version 17}}})
-
-(def test-example
-  {:vs [{:title "Rocks"
-         :runner {:t :ec2, :instance "m1.small"}
-         :sut {:t :jar,
-               :jre 17
-               :uri "s3://....",
-               :args {}}}
-        {:title "LMDB"
-         :runner {}
-         :sut {}}]})
