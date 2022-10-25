@@ -1,6 +1,6 @@
 (ns xtdb.bench.core1
   (:require [xtdb.api :as xt]
-            [xtdb.bench.metrics :as bm]
+            [xtdb.bench.measurement :as bm]
             [xtdb.bus :as bus]
             [xtdb.bench2 :as b2]
             [xtdb.bench.tools :as bt]
@@ -147,7 +147,7 @@
 
 (defn wrap-task [task f]
   (let [{:keys [stage]} task]
-    (bm/wrap-transaction
+    (bm/wrap-task
       task
       (if stage
         (fn instrumented-stage [worker]
@@ -193,14 +193,14 @@
                                          :rocks [['com.xtdb/xtdb-rocksdb]]
                                          :lmdb [['com.xtdb/xtdb-lmdb]])]
                   (if ver dep [nm sha])))))
-    :aot ['xtdb.bench.main]))
+    :aot ['xtdb.bench.main2]))
 
 (defn install-self-to-m2 []
   (bt/sh-ctx
     {:dir "bench"}
     (bt/sh "lein" "install")))
 
-(defn fulfil-sut [sut & {:keys [use-existing-dev-snapshot]}]
+(defn provide-sut-requirements [sut & {:keys [use-existing-dev-snapshot]}]
   (let [{:keys [jar, repository, sha]} sut]
     (assert (nil? sh/*sh-dir*) "must be in xtdb project dir!")
 
@@ -220,3 +220,17 @@
       (bt/sh-ctx {:dir tmp-dir} (bt/sh "lein" "uberjar"))
       (bt/log "Providing sut.jar")
       (bt/copy {:t :file, :file jar-local} jar))))
+
+(defn sut-node-opts [{:keys [index, log, docs]}]
+  (let [rocks-kv (fn [] {:xtdb/module 'xtdb.rocksdb/->kv-store,
+                         :db-dir-suffix "kv"
+                         :db-dir (xio/create-tmpdir "bench")})
+        lmdb-kv (fn [] {:xtdb/module 'xtdblmdb/->kv-store,
+                        :db-dir-suffix "kv"
+                        :db-dir (xio/create-tmpdir "bench")})]
+    {:xtdb/tx-log {:kv-store (case log :rocks (rocks-kv) :lmdb (lmdb-kv))}
+     :xtdb/document-store {:kv-store (case docs :rocks (rocks-kv) :lmdb (lmdb-kv))}
+     :xtdb/index-store {:kv-store (case index :rocks (rocks-kv) :lmdb (lmdb-kv))}}))
+
+(defn start-sut ^Closeable [sut]
+  (xt/start-node (sut-node-opts sut)))

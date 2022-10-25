@@ -1,11 +1,13 @@
 (ns xtdb.bench2
-  (:require [clojure.walk :as walk])
+  (:require [clojure.walk :as walk]
+            [clojure.string :as str])
   (:import (java.util.concurrent.atomic AtomicLong)
            (java.util.concurrent ConcurrentHashMap)
            (java.util Random Comparator)
            (com.google.common.collect MinMaxPriorityQueue)
            (java.util.function Function)
-           (java.time Instant Duration Clock)))
+           (java.time Instant Duration Clock)
+           (oshi SystemInfo)))
 
 (set! *warn-on-reflection* false)
 
@@ -106,6 +108,27 @@
   (doseq [^Thread thread (filter #(.isAlive ^Thread %) threads)]
     (.interrupt thread)))
 
+(defn get-system-info
+  "Returns data about the hardware / OS running this JVM."
+  []
+  (let [si (SystemInfo.)
+        os (.getOperatingSystem si)
+        os-version (.getVersionInfo os)
+        os-codename (.getCodeName os-version)
+        os-version-number (.getVersion os-version)
+        arch (System/getProperty "os.arch")
+        hardware (.getHardware si)
+        cpu (.getProcessor hardware)
+        cpu-identifier (.getProcessorIdentifier cpu)
+        cpu-name (.getName cpu-identifier)
+        cpu-core-count (.getPhysicalProcessorCount cpu)
+        cpu-max-freq (.getMaxFreq cpu)
+        ram (.getMemory hardware)]
+    {:arch arch
+     :os (str/join " " (remove str/blank? [(.getFamily os) os-codename os-version-number]))
+     :memory (format "%sGB" (/ (long (.getTotal ram)) (* 1024 1024 1024)))
+     :cpu (format "%s, %s cores, %.2fGHZ max" cpu-name cpu-core-count (double (/ cpu-max-freq 1e9)))}))
+
 (defn compile-benchmark [benchmark hook]
   (let [seed (:seed benchmark 0)
         lift-f (fn [f] (if (vector? f) #(apply (first f) % (rest f)) f))
@@ -200,10 +223,49 @@
             custom-state (ConcurrentHashMap.)
             root-random (Random. seed)
             reports (atom [])
-            worker (->Worker sut root-random domain-state custom-state clock reports)]
+            worker (->Worker sut root-random domain-state custom-state clock reports)
+            start-ns (System/nanoTime)]
         (doseq [f fns]
           (f worker))
-        @reports))))
+        {:system (get-system-info)
+         ;; todo java opts?
+         :start-ns start-ns
+         :end-ns (System/nanoTime)
+         :reports @reports}))))
 
 (defn add-report [worker report]
   (swap! (:reports worker) conj report))
+
+(comment
+  ;; low level benchmark evaluation in process...
+  ;; a benchmark is a data structure which is compiled to produce a function of system-under-test to report.
+  ;; compiler takes a hook fn for applying measurement policy independently of the benchmark definition.
+
+  ;; e.g compiling a benchmark that targets an xt node will produce a function that takes a node instance as its parameter.
+
+  (def foo-bench
+    (compile-benchmark
+      ;; benchmark definition
+      {:seed 0
+       :tasks [{:t :call,
+                :stage :foo
+                ;; receives system-under test, this arg will be threaded through when the benchmark
+                ;; is eval'd, e.g an xt node.
+                :f (fn [_sut] (Thread/sleep 100))}]}
+      ;; middleware hook for injecting measurement, proxies and what not
+      (fn [_task f] f)))
+
+  ;; provide sut here, using 42 because the runner does not care
+  (foo-bench 42)
+
+  ;; apply more measurements to get a more interesting output
+  ((compile-benchmark
+     {:seed 0
+      :tasks [{:t :call,
+               :stage :foo
+               ;; receives system-under test, this arg will be threaded through when the benchmark
+               ;; is eval'd, e.g an xt node.
+               :f (fn [_sut] (Thread/sleep 100))}]}
+     ;; can use measurement to wrap stages/transactions with metrics
+     @(requiring-resolve `xtdb.bench.measurement/wrap-task))
+   42))

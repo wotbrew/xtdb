@@ -2,9 +2,10 @@
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.java.shell :as sh]
-            [xtdb.io :as xio])
+            [xtdb.bench2 :as b2])
   (:import (java.time.format DateTimeFormatter)
-           (java.time LocalDateTime Instant ZoneId)))
+           (java.time LocalDateTime Instant ZoneId)
+           (java.io File Closeable)))
 
 (defn timestamp-path [epoch-ms]
   (let [ldt (LocalDateTime/ofInstant (Instant/ofEpochMilli epoch-ms) (ZoneId/of "Europe/London"))]
@@ -51,56 +52,6 @@
          :script [["aws" "cp" jar-path "sut.jar"]
                   ["java" "-jar" "sut.jar" manifest-loc]]}))))
 
-(defn build-io-fns
-  "Returns a set of fns for doing IO, running processes and stuff.
-
-  Captures common concerns for bench builds such as error handling, logging, cleanup so the scripts are less of a mess!
-
-  Returns a map of functions:
-
-  :sh - like clojure.java.shell/sh, returns a string out. Takes an optional map first instead of needing to splice options onto the end of the command args.
-     e.g (sh {:env {\"SOME_VAR\" \"42\"}} \"my\" \"command\" \"args\")
-  :cd - changes the default working directory
-  :log - like println
-  :home-file returns a file relative to the home dir
-  :temp-dir returns a tmp-dir for the given string key, creating it for the first call. "
-  []
-  (let [working-dir (atom nil)
-        cd (fn cd [dir-name] (println "  $ cd" (reset! working-dir (str dir-name))))
-        sh (fn sh [opts? & args]
-             (let [opts (when (map? opts?) opts?)
-                   args (if (map? opts?) args (cons opts? args))
-                   {:keys [dir, env]} opts
-                   _ (when dir (println "  dir:" dir))
-                   _ (doseq [[e] env] (println "  env:" e))
-                   command-str (str/join " " args)
-                   _ (println "  $" command-str)
-                   use-dir (or dir @working-dir)
-                   opts (update opts :env merge {"HOME" (System/getenv "HOME")
-                                                 "PATH" (System/getenv "PATH")})
-                   opts-to-sh (if use-dir (assoc opts :dir use-dir) opts)
-                   {:keys [exit, err, out]} (apply sh/sh (apply concat args opts-to-sh))]
-               (when-not (= 0 exit)
-                 (throw (ex-info (or (not-empty out) "Command failed")
-                                 {:command command-str
-                                  :exit exit
-                                  :out out
-                                  :err err})))
-               out))
-        aws (fn [& args]
-              (apply sh "aws" (concat args
-                                      ["--output" "json"
-                                       ;; todo require explicit setup
-                                       "--region" "eu-west-1"
-                                       "--profile" "juxt"])))
-        log println]
-    {:cd cd
-     :log log
-     :sh sh
-     :aws aws
-     :home-file (partial io/file (System/getenv "HOME"))
-     :temp-dir (memoize (partial xio/create-tmpdir))}))
-
 (defn log [& args] (apply println args))
 
 (defn sh-ctx* [opts f]
@@ -134,7 +85,7 @@
     out))
 
 (defn aws [& args]
-  ;; todo profile, region all that stuff
+  ;; todo rethink profile, region all that stuff
   (apply sh "aws"
          (concat args ["--output" "json"
                        ;; todo require explicit setup
@@ -197,17 +148,6 @@
        :env resolved-env
        :sut resolved-sut})))
 
-(def bench-req-example
-  {:title "Rocks"
-   :t :auctionmark,
-   :arg {:duration "PT30M", :thread-count 8}
-   :env {:t :ec2, :instance "m1.small"}
-   :sut {:t :xtdb,
-         :version "1.22.0"
-         :index :rocks
-         :log :rocks
-         :docs :rocks}})
-
 (comment
 
   (def bench-req-example
@@ -221,9 +161,24 @@
            :log :rocks
            :docs :rocks}})
 
-  ;; resolves the request to manifest, where ambiguities in the request are removed (e.g branch 2 sha, amis, paths)
+  ;; resolves the request to a resolved request, where ambiguities in the request are removed (e.g branch 2 sha, amis, paths)
   (resolve-req bench-req-example)
 
-
-
   )
+
+(defn run-resolved! [resolved-req]
+  (let [{:keys [report, sut, t, args]} resolved-req
+        benchmark (case t :auctionmark ((requiring-resolve 'xtdb.bench.auctionmark/benchmark) args))
+        {:keys [start, hook]}
+        (case (:t sut)
+          :xtdb
+          {:start @(requiring-resolve 'xtdb.bench.core1/start-sut)
+           :hook @(requiring-resolve 'xtdb.bench.core1/wrap-task)})
+        run-benchmark (b2/compile-benchmark benchmark hook)]
+    (with-open [^Closeable sut (start sut)]
+      (let [out (run-benchmark sut)
+            tmp (File/createTempFile "report" ".edn")]
+        (try
+          (spit tmp (pr-str out))
+          (copy {:t :file, :file tmp} report)
+          (finally (.delete tmp)))))))

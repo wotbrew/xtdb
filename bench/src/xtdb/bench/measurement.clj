@@ -1,4 +1,4 @@
-(ns xtdb.bench.metrics
+(ns xtdb.bench.measurement
   (:require [clojure.string :as str]
             [xtdb.bench2 :as b2])
   (:import (java.time Duration)
@@ -87,8 +87,12 @@
         sample-freq
         TimeUnit/MILLISECONDS)
       (try
-        (f worker)
-        (b2/add-report worker {:stage k, :metrics (sampler :summarize)})
+        (let [start-ns (System/nanoTime)]
+          (f worker)
+          (b2/add-report worker {:stage k,
+                                 :start-ns start-ns
+                                 :end-ns (System/nanoTime)
+                                 :metrics (sampler :summarize)}))
         (finally
           (.shutdownNow executor))))))
 
