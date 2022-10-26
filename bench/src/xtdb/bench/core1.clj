@@ -162,6 +162,31 @@
     (with-open [node (xt/start-node node-opts)]
       (f node))))
 
+(defn resolve-sut [sut loc-fn]
+  (let [{:keys [repository
+                version
+                index
+                docs
+                log
+                jre]
+         :or {repository "git@github.com:xtdb/xtdb.git"
+              version "master"
+              index :rocks
+              docs :rocks
+              log :rocks
+              jre {:t :corretto, :version 17}}} sut
+        sha (bt/resolve-sha repository version)]
+    (merge
+      sut
+      {:repository repository
+       :version version
+       :index index
+       :docs docs
+       :log log
+       :sha sha
+       :jre jre
+       :jar (loc-fn "sut.jar")})))
+
 (defn install-sha-artifacts-to-m2 [repository sha]
   (let [tmp-dir (xio/create-tmpdir "benchmark-xtdb")]
     (bt/sh-ctx
@@ -212,7 +237,7 @@
       (bt/log "Installing target sha to ~/.m2")
       (install-sha-artifacts-to-m2 repository sha))
 
-    (bt/log "Building sut")
+    (bt/log "Building sut.jar")
     (let [proj-form (sut-lein-project sut)
           tmp-dir (xio/create-tmpdir "sut-lein")
           jar-local (io/file tmp-dir "target" "sut-0-SNAPSHOT-standalone.jar")]
@@ -232,5 +257,7 @@
      :xtdb/document-store {:kv-store (case docs :rocks (rocks-kv) :lmdb (lmdb-kv))}
      :xtdb/index-store {:kv-store (case index :rocks (rocks-kv) :lmdb (lmdb-kv))}}))
 
-(defn start-sut ^Closeable [sut]
-  (xt/start-node (sut-node-opts sut)))
+(defn prep [{:keys [sut]}]
+  (let [node-opts (sut-node-opts sut)]
+    {:start #(xt/start-node node-opts)
+     :hook wrap-task}))

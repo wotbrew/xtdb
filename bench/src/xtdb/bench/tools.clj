@@ -22,35 +22,12 @@
       {:t :file,
        ;; todo tmp-dir prop
        :file (.getAbsolutePath (io/file "/tmp" (bench-path epoch-ms filename)))})
-    :ec2
-    (fn ec2-path [filename]
-      {:t :s3,
-       :bucket "xtdb-bench"
-       :key (bench-path epoch-ms filename)})))
+    :ec2 ((requiring-resolve 'xtdb.bench.ec2/loc-fn) env epoch-ms)))
 
 (defn resolve-env [env sut manifest-loc]
   (case (:t env)
     :local env
-    :ec2
-    (let [{:keys [instance,
-                  ami]
-           :or {instance "m1.small"
-                ami "ami-0ee415e1b8b71305f"}} env
-          {:keys [jre, jar]} sut
-
-          jre-package
-          (case [(:t jre) (:version jre)]
-            [:corretto 17] "java-17-amazon-corretto-headless")
-
-          jar-path (case (:t jar) :s3 (str "s3://" (:bucket jar) "/" (:key jar)))]
-      (merge
-        env
-        {:t :ec2
-         :instance instance
-         :ami ami
-         :packages [jre-package, "awscli"]
-         :script [["aws" "cp" jar-path "sut.jar"]
-                  ["java" "-jar" "sut.jar" manifest-loc]]}))))
+    :ec2 ((requiring-resolve 'xtdb.bench.ec2/resolve-env) env sut manifest-loc)))
 
 (defn log [& args] (apply println args))
 
@@ -92,44 +69,21 @@
                        "--region" "eu-west-1"
                        "--profile" "xtdb-bench"])))
 
-(defn s3-copy-path [loc]
+(defn s3-cli-path [loc]
   (case (:t loc)
     :s3 (str "s3://" (:bucket loc) "/" (:key loc))
     :file (.getAbsolutePath (io/file (:file loc)))))
 
 (defn copy [from to]
   (case (:t to)
-    :s3 (aws "s3" "cp" (s3-copy-path from) (s3-copy-path to))))
+    :s3 (aws "s3" "cp" (s3-cli-path from) (s3-cli-path to))))
 
 (defn resolve-sha [repository ref-spec]
   (first (str/split (sh "git" "ls-remote" repository ref-spec) #"\t")))
 
 (defn resolve-sut [sut loc-fn]
   (case (:t sut)
-    :xtdb
-    (let [{:keys [repository
-                  version
-                  index
-                  docs
-                  log
-                  jre]
-           :or {repository "git@github.com:xtdb/xtdb.git"
-                version "master"
-                index :rocks
-                docs :rocks
-                log :rocks
-                jre {:t :corretto, :version 17}}} sut
-          sha (resolve-sha repository version)]
-      (merge
-        sut
-        {:repository repository
-         :version version
-         :index index
-         :docs docs
-         :log log
-         :sha sha
-         :jre jre
-         :jar (loc-fn "sut.jar")}))))
+    :xtdb ((requiring-resolve 'xtdb.bench.core1/resolve-sut) sut loc-fn)))
 
 (defn resolve-req
   [req]
@@ -162,23 +116,30 @@
            :docs :rocks}})
 
   ;; resolves the request to a resolved request, where ambiguities in the request are removed (e.g branch 2 sha, amis, paths)
-  (resolve-req bench-req-example)
-
-  )
+  (resolve-req bench-req-example))
 
 (defn run-resolved! [resolved-req]
   (let [{:keys [report, sut, t, args]} resolved-req
         benchmark (case t :auctionmark ((requiring-resolve 'xtdb.bench.auctionmark/benchmark) args))
         {:keys [start, hook]}
         (case (:t sut)
-          :xtdb
-          {:start @(requiring-resolve 'xtdb.bench.core1/start-sut)
-           :hook @(requiring-resolve 'xtdb.bench.core1/wrap-task)})
+          :xtdb ((requiring-resolve 'xtdb.bench.core1/prep) resolved-req))
         run-benchmark (b2/compile-benchmark benchmark hook)]
-    (with-open [^Closeable sut (start sut)]
+    (with-open [^Closeable sut (start)]
       (let [out (run-benchmark sut)
             tmp (File/createTempFile "report" ".edn")]
         (try
           (spit tmp (pr-str out))
           (copy {:t :file, :file tmp} report)
           (finally (.delete tmp)))))))
+
+(defn request-run! [req]
+  (let [{:keys [sut, env] :as resolved} (resolve-req req)]
+
+    (case (:t sut)
+      :xtdb ((requiring-resolve 'xtdb.bench.core1/provide-sut-requirements) sut))
+
+    (case (:t env)
+      :ec2 ((requiring-resolve 'xtdb.bench.ec2/run-provided!) resolved))
+
+    ))
