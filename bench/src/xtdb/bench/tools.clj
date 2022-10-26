@@ -133,13 +133,16 @@
           (copy {:t :file, :file tmp} report)
           (finally (.delete tmp)))))))
 
-(defn request-run! [req]
-  (let [{:keys [sut, env] :as resolved} (resolve-req req)]
+(defn setup! [req]
+  (let [{:keys [manifest, sut, env] :as resolved} (resolve-req req)
+        manifest-file (File/createTempFile "manifest" ".edn")]
+
+    (spit manifest-file (pr-str resolved))
+    (copy {:t :file, :file manifest-file} manifest)
 
     (case (:t sut)
       :xtdb ((requiring-resolve 'xtdb.bench.core1/provide-sut-requirements) sut))
 
-    (case (:t env)
-      :ec2 ((requiring-resolve 'xtdb.bench.ec2/run-provided!) resolved))
-
-    ))
+    {:resolved-req resolved
+     :env (case (:t env)
+            :ec2 ((requiring-resolve 'xtdb.bench.ec2/setup!) resolved))}))
