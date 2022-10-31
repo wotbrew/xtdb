@@ -5,7 +5,7 @@
             [clojure.string :as str])
   (:import (java.time LocalDateTime Instant ZoneId Duration)
            (java.time.format DateTimeFormatter)
-           (java.io File StringWriter)
+           (java.io File StringWriter Closeable)
            (clojure.lang ExceptionInfo)))
 
 (defn ec2-stack-create-cli-input [env id]
@@ -21,6 +21,7 @@
                         "ParameterValue" v}))
    "OnFailure" "DELETE"
    ;; yagni?! not sure if already tagged - verify
+   ;; todo lifetime for gc task
    "Tags" (vec (for [[k v] {"BenchmarkId" id}]
                  {"Key" k "Value" v}))})
 
@@ -29,7 +30,7 @@
 
 (defn ec2-stack-ls []
   (bt/aws "cloudformation" "list-stacks"
-          #_#_"--stack-status-filter" "CREATE_COMPLETE"
+          "--stack-status-filter" "CREATE_COMPLETE"
           "--query" (format "StackSummaries[?starts_with(StackName, `%s`)]" "bench-")))
 
 (defn ec2-stack-delete [stack-name]
@@ -41,12 +42,12 @@
      :bucket "xtdb-bench"
      :key (bt/bench-path epoch-ms filename)}))
 
-(defn resolve-env [env sut manifest-loc]
+(defn resolve-env [env sut]
   (let [{:keys [instance,
                 ami]
          :or {instance "m1.small"
               ami "ami-0ee415e1b8b71305f"}} env
-        {:keys [jre, jar]} sut
+        {:keys [jre]} sut
 
         jre-package
         (case [(:t jre) (:version jre)]
@@ -59,7 +60,6 @@
 
 (defn ec2-stack-describe [id]
   (-> (bt/aws "cloudformation" "describe-stacks" "--stack-name" id)
-      json/read-str
       (get "Stacks")
       first))
 
@@ -68,7 +68,7 @@
 
 (defn- ssm-get-private-key [key-pair-id]
   (let [key-name (str "/ec2/keypair/" key-pair-id)
-        param (when key-pair-id (json/read-str (bt/aws "ssm" "get-parameter" "--name" key-name "--with-decryption")))]
+        param (when key-pair-id (bt/aws "ssm" "get-parameter" "--name" key-name "--with-decryption"))]
     (get-in param ["Parameter" "Value"])))
 
 (defn ssh-remote [stack]
@@ -84,6 +84,11 @@
      :host public-dns-name
      :key-file key-file}))
 
+(defrecord Ec2Handle [id stack user host key-file]
+  Closeable
+  (close [_]
+    (ec2-stack-delete id)))
+
 (defn ssh-remote-cmd [{:keys [user, host, key-file]}]
   ["ssh"
    "-oStrictHostKeyChecking=no"
@@ -98,7 +103,7 @@
                                              (ZoneId/of "Europe/London"))
                     (.format (DateTimeFormatter/ofPattern "YYYY-MM-dd-HH-mm-ss-SS")))))
 
-(defn provision-infra [resolved-req]
+(defn provision! ^Ec2Handle [resolved-req]
   (let [id (aws-id (:epoch-ms resolved-req))
         wait-duration (Duration/ofMinutes 5)
         sleep-duration (Duration/ofSeconds 30)
@@ -123,21 +128,15 @@
     (bt/log "Stack created")
     (bt/log "  id:" id)
 
-    {:id id
-     :stack @stack}))
+    (map->Ec2Handle (merge {:id id :stack @stack} (ssh-remote @stack)))))
 
-(defn setup! [resolved-req]
-  (let [{:keys [manifest, sut, env]} resolved-req
-        {:keys [jar]} sut
-        {:keys [id, stack]} (provision-infra resolved-req)
-        sr (ssh-remote stack)
-        ssh-wait-duration (Duration/ofMinutes 2)
+(defn await-ssh [ec2]
+  (let [ssh-wait-duration (Duration/ofMinutes 2)
         ssh-wait-until (+ (System/currentTimeMillis) (.toMillis ssh-wait-duration))]
-
     (trampoline
       (fn try-ssh []
         (try
-          (binding [*out* (StringWriter.)] (ssh sr "echo" "ping"))
+          (binding [*out* (StringWriter.)] (ssh ec2 "echo" "ping"))
           (catch ExceptionInfo e
             (let [{:keys [err]} (ex-data e)]
               (if (and (string? err)
@@ -145,19 +144,60 @@
                        (< (System/currentTimeMillis) ssh-wait-until))
                 (do (Thread/sleep 1000)
                     try-ssh)
-                (throw e)))))))
+                (throw e)))))))))
 
-    (when-some [packages (seq (:packages env))]
-      (bt/log "Installing packages, this may take a while")
-      (apply ssh sr "sudo" "yum" "install" "-y" packages))
+(defn setup!
+  ([resolved-req] (setup! resolved-req (provision! resolved-req)))
+  ([resolved-req ec2]
+   (let [{:keys [manifest, sut, env]} resolved-req
+         {:keys [jar]} sut]
 
-    (bt/log "Downloading sut.jar")
-    (ssh sr "aws" "s3" "cp" (bt/s3-cli-path jar) "sut.jar")
+     (await-ssh ec2)
 
-    (bt/log "Downloading manifest.edn")
-    (ssh sr "aws" "s3" "cp" (bt/s3-cli-path manifest) "manifest.edn")
+     (when-some [packages (seq (:packages env))]
+       (bt/log "Installing packages, this may take a while")
+       (apply ssh ec2 "sudo" "yum" "install" "-y" packages))
 
-    {:id id
-     :stack stack
-     :ssh-remote sr
-     :run-cmd ["java" "-jar" "sut.jar" "manifest.edn"]}))
+     (bt/log "Downloading sut.jar")
+     (ssh ec2 "aws" "s3" "cp" (bt/s3-cli-path jar) "sut.jar")
+
+     (bt/log "Downloading manifest.edn")
+     (ssh ec2 "aws" "s3" "cp" (bt/s3-cli-path manifest) "manifest.edn")
+
+     ec2)))
+
+(defn clj [ec2 & code]
+  (ssh ec2
+       "java"
+       "-jar" "sut.jar"
+       "-e" (pr-str (pr-str (list* 'do code)))))
+
+(defn ssh-remote-tunnel ^Process [{:keys [user, host, key-file, local-port, remote-port]}]
+  (-> (doto (ProcessBuilder. ["ssh"
+                              "-oStrictHostKeyChecking=no"
+                              "-i" (.getAbsolutePath (io/file key-file))
+                              "-NL"
+                              (format "%s:localhost:%s" local-port remote-port)
+                              (str user "@" host)])
+        (.inheritIO))
+      (.start)))
+
+(defn repl [ec2]
+  (let [repl-p nil
+        #_(doto (ProcessBuilder.
+                (->> (concat
+                       (ssh-remote-cmd ec2)
+                       ["java"
+                        "-Dclojure.server.repl=\"{:port 5555, :accept clojure.core.server/repl}\""
+                        "-jar" "sut.jar"
+                        "-e" (pr-str (pr-str '(let [o (Object.)] (try (locking o (.wait o)) (catch InterruptedException _)))))])
+                     (vec)))
+          (.inheritIO)
+          (.start))
+
+        remote-p
+        (ssh-remote-tunnel (assoc ec2 :local-port 5555, :remote-port 5555))]
+
+
+    {:remote-p remote-p,
+     :repl-p repl-p}))

@@ -2,7 +2,8 @@
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.java.shell :as sh]
-            [xtdb.bench2 :as b2])
+            [xtdb.bench2 :as b2]
+            [clojure.data.json :as json])
   (:import (java.time.format DateTimeFormatter)
            (java.time LocalDateTime Instant ZoneId)
            (java.io File Closeable)))
@@ -24,10 +25,10 @@
        :file (.getAbsolutePath (io/file "/tmp" (bench-path epoch-ms filename)))})
     :ec2 ((requiring-resolve 'xtdb.bench.ec2/loc-fn) env epoch-ms)))
 
-(defn resolve-env [env sut manifest-loc]
+(defn resolve-env [env sut]
   (case (:t env)
     :local env
-    :ec2 ((requiring-resolve 'xtdb.bench.ec2/resolve-env) env sut manifest-loc)))
+    :ec2 ((requiring-resolve 'xtdb.bench.ec2/resolve-env) env sut)))
 
 (defn log [& args] (apply println args))
 
@@ -61,13 +62,18 @@
                        :err err})))
     out))
 
+(def probably-running-in-ec2 (= "ec2-user" (System/getenv "USER")))
+
 (defn aws [& args]
-  ;; todo rethink profile, region all that stuff
-  (apply sh "aws"
-         (concat args ["--output" "json"
-                       ;; todo require explicit setup
-                       "--region" "eu-west-1"
-                       "--profile" "xtdb-bench"])))
+  (let [cmd (concat
+              args
+              ["--output" "json"
+               ;; todo require explicit setup
+               "--region" "eu-west-1"]
+              (when-not probably-running-in-ec2
+                ["--profile" "xtdb-bench"]))
+        out (apply sh "aws" cmd)]
+    (try (json/read-str out) (catch Throwable _ out))))
 
 (defn s3-cli-path [loc]
   (case (:t loc)
@@ -92,7 +98,7 @@
         loc-fn (bench-loc-fn env epoch-ms)
         resolved-sut (resolve-sut sut loc-fn)
         manifest-loc (loc-fn "manifest.edn")
-        resolved-env (resolve-env env resolved-sut manifest-loc)]
+        resolved-env (resolve-env env resolved-sut)]
     (merge
       req
       {:epoch-ms epoch-ms
@@ -107,13 +113,24 @@
   (def bench-req-example
     {:title "Rocks"
      :t :auctionmark,
-     :arg {:duration "PT30M", :thread-count 8}
+     :args {:duration "PT30M", :thread-count 8}
      :env {:t :ec2, :instance "m1.small"}
      :sut {:t :xtdb,
            :version "1.22.0"
            :index :rocks
            :log :rocks
            :docs :rocks}})
+
+  ;; todo this should also work? or should we just in-process tools that look a bit like this?
+  {:title "LMDB"
+   :t :auctionmark
+   :args {:duration "PT30S"}
+   :env {:t :local}
+   :sut {:t :xtdb,
+         :version "1.22.0"
+         :index :rocks
+         :log :rocks
+         :docs :rocks}}
 
   ;; resolves the request to a resolved request, where ambiguities in the request are removed (e.g branch 2 sha, amis, paths)
   (resolve-req bench-req-example))
@@ -144,5 +161,5 @@
       :xtdb ((requiring-resolve 'xtdb.bench.core1/provide-sut-requirements) sut))
 
     {:resolved-req resolved
-     :env (case (:t env)
-            :ec2 ((requiring-resolve 'xtdb.bench.ec2/setup!) resolved))}))
+     :handle (case (:t env)
+               :ec2 ((requiring-resolve 'xtdb.bench.ec2/setup!) resolved))}))

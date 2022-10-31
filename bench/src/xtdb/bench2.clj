@@ -1,6 +1,5 @@
 (ns xtdb.bench2
-  (:require [clojure.walk :as walk]
-            [clojure.string :as str])
+  (:require [clojure.string :as str])
   (:import (java.util.concurrent.atomic AtomicLong)
            (java.util.concurrent ConcurrentHashMap)
            (java.util Random Comparator)
@@ -8,8 +7,6 @@
            (java.util.function Function)
            (java.time Instant Duration Clock)
            (oshi SystemInfo)))
-
-(set! *warn-on-reflection* false)
 
 (defrecord Worker [sut random domain-state custom-state clock reports])
 
@@ -20,6 +17,8 @@
   (.computeIfAbsent ^ConcurrentHashMap (:domain-state worker) domain (reify Function (apply [_ _] (AtomicLong.)))))
 
 (defn rng ^Random [worker] (:random worker))
+
+(defn current-timestamp-ms ^long [worker] (.millis ^Clock (:clock worker)))
 
 (defn id
   "Defines some function of a continuous integer domain, literally just identity, but with uh... identity, e.g
@@ -101,7 +100,7 @@
       (nth coll idx nil))))
 
 (defn- await-threads [threads ^Duration wait]
-  (when-some [t (first threads)]
+  (when-some [^Thread t (first threads)]
     (.join t (.toMillis wait)))
 
   ;; warn/alert?
@@ -126,7 +125,7 @@
         ram (.getMemory hardware)]
     {:arch arch
      :os (str/join " " (remove str/blank? [(.getFamily os) os-codename os-version-number]))
-     :memory (format "%sGB" (/ (long (.getTotal ram)) (* 1024 1024 1024)))
+     :memory (format "%sGB" (quot (long (.getTotal ram)) (* 1024 1024 1024)))
      :cpu (format "%s, %s cores, %.2fGHZ max" cpu-name cpu-core-count (double (/ cpu-max-freq 1e9)))}))
 
 (defn compile-benchmark [benchmark hook]
@@ -161,16 +160,15 @@
 
                     thread-loop
                     (fn run-pool-thread-loop [worker]
-                      (let [^Clock clock (:clock worker)]
-                        (loop [wait-until (+ (.millis clock) (.toMillis duration))]
-                          (f worker)
-                          (when (< (.millis clock) wait-until)
-                            (sleep)
-                            (recur wait-until)))))
+                      (loop [wait-until (+ (current-timestamp-ms worker) (.toMillis duration))]
+                        (f worker)
+                        (when (< (current-timestamp-ms worker) wait-until)
+                          (sleep)
+                          (recur wait-until))))
 
                     start-thread
                     (fn [root-worker i]
-                      (let [worker (assoc root-worker :random (Random. (.nextLong ^Random (:random root-worker))))]
+                      (let [worker (assoc root-worker :random (Random. (.nextLong (rng root-worker))))]
                         (doto (Thread. ^Runnable (fn [] (thread-loop worker)))
                           (.start))))]
 
@@ -186,7 +184,7 @@
                     thread-task-fns (mapv compile-task thread-tasks)
                     start-thread
                     (fn [root-worker i f]
-                      (let [worker (assoc root-worker :random (Random. (.nextLong ^Random (:random root-worker))))]
+                      (let [worker (assoc root-worker :random (Random. (.nextLong (rng root-worker))))]
                         (doto (Thread. ^Runnable (fn [] (f worker)))
                           (.start))))]
                 (fn run-concurrently [worker]
@@ -211,9 +209,9 @@
                     freq-ms (.toMillis (or freq Duration/ZERO))
                     sleep (if (pos? freq-ms) #(Thread/sleep freq-ms) (constantly nil))]
                 (fn run-freq-job [worker]
-                  (loop [wait-until (+ (.millis ^Clock (:clock worker)) duration-ms)]
+                  (loop [wait-until (+ (current-timestamp-ms worker) duration-ms)]
                     (f worker)
-                    (when (< (.millis (:clock worker)) wait-until)
+                    (when (< (current-timestamp-ms worker) wait-until)
                       (sleep)
                       (recur wait-until))))))))
         fns (mapv compile-task (:tasks benchmark))]
