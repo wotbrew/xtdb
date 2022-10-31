@@ -222,13 +222,13 @@
             root-random (Random. seed)
             reports (atom [])
             worker (->Worker sut root-random domain-state custom-state clock reports)
-            start-ns (System/nanoTime)]
+            start-ms (System/currentTimeMillis)]
         (doseq [f fns]
           (f worker))
         {:system (get-system-info)
          ;; todo java opts?
-         :start-ns start-ns
-         :end-ns (System/nanoTime)
+         :start-ms start-ms
+         :end-ms (System/currentTimeMillis)
          :reports @reports}))))
 
 (defn add-report [worker report]

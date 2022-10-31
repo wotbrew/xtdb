@@ -8,7 +8,9 @@
            (java.io File StringWriter Closeable)
            (clojure.lang ExceptionInfo)))
 
-(defn ec2-stack-create-cli-input [env id]
+(set! *warn-on-reflection* false)
+
+(defn cfn-stack-create-cli-input [env id]
   {"StackName" id
    "TemplateBody" (slurp (or (io/resource "xtdb-ec2.yml")
                              (io/file "bench/resources/xtdb-ec2.yml")))
@@ -25,15 +27,15 @@
    "Tags" (vec (for [[k v] {"BenchmarkId" id}]
                  {"Key" k "Value" v}))})
 
-(defn ec2-stack-create [env id]
-  (bt/aws "cloudformation" "create-stack" "--cli-input-json" (json/write-str (ec2-stack-create-cli-input env id))))
+(defn cfn-stack-create [env id]
+  (bt/aws "cloudformation" "create-stack" "--cli-input-json" (json/write-str (cfn-stack-create-cli-input env id))))
 
-(defn ec2-stack-ls []
+(defn cfn-stack-ls []
   (bt/aws "cloudformation" "list-stacks"
           "--stack-status-filter" "CREATE_COMPLETE"
           "--query" (format "StackSummaries[?starts_with(StackName, `%s`)]" "bench-")))
 
-(defn ec2-stack-delete [stack-name]
+(defn cfn-stack-delete [stack-name]
   (bt/aws "cloudformation" "delete-stack" "--stack-name" stack-name))
 
 (defn loc-fn [_env epoch-ms]
@@ -58,7 +60,7 @@
        :ami ami
        :packages [jre-package "awscli"]})))
 
-(defn ec2-stack-describe [id]
+(defn cfn-stack-describe [id]
   (-> (bt/aws "cloudformation" "describe-stacks" "--stack-name" id)
       (get "Stacks")
       first))
@@ -87,16 +89,16 @@
 (defrecord Ec2Handle [id stack user host key-file]
   Closeable
   (close [_]
-    (ec2-stack-delete id)))
+    (cfn-stack-delete id)))
 
-(defn ssh-remote-cmd [{:keys [user, host, key-file]}]
+(defn ssh-cmd [{:keys [user, host, key-file]}]
   ["ssh"
    "-oStrictHostKeyChecking=no"
    "-i" (.getAbsolutePath (io/file key-file))
    (str user "@" host)])
 
 (defn ssh [ssh-remote cmd & cmd-args]
-  (apply bt/sh (concat (ssh-remote-cmd ssh-remote) [cmd] cmd-args)))
+  (apply bt/sh (concat (ssh-cmd ssh-remote) [cmd] cmd-args)))
 
 (defn aws-id [epoch-ms]
   (str "bench-" (-> (LocalDateTime/ofInstant (Instant/ofEpochMilli epoch-ms)
@@ -108,9 +110,9 @@
         wait-duration (Duration/ofMinutes 5)
         sleep-duration (Duration/ofSeconds 30)
         stack (atom nil)
-        poll-stack #(reset! stack (ec2-stack-describe id))]
+        poll-stack #(reset! stack (cfn-stack-describe id))]
 
-    (ec2-stack-create (:env resolved-req) id)
+    (cfn-stack-create (:env resolved-req) id)
 
     (bt/log "Waiting for stack, this may take a while")
     (bt/log "  id:" id)
@@ -146,6 +148,10 @@
                     try-ssh)
                 (throw e)))))))))
 
+(defn install-packages [ec2 packages]
+  (when (seq packages)
+    (apply ssh ec2 "sudo" "yum" "install" "-y" packages)))
+
 (defn setup!
   ([resolved-req] (setup! resolved-req (provision! resolved-req)))
   ([resolved-req ec2]
@@ -172,7 +178,7 @@
        "-jar" "sut.jar"
        "-e" (pr-str (pr-str (list* 'do code)))))
 
-(defn ssh-remote-tunnel ^Process [{:keys [user, host, key-file, local-port, remote-port]}]
+(defn ssh-fwd ^Process [{:keys [user, host, key-file, local-port, remote-port]}]
   (-> (doto (ProcessBuilder. ["ssh"
                               "-oStrictHostKeyChecking=no"
                               "-i" (.getAbsolutePath (io/file key-file))
@@ -182,22 +188,71 @@
         (.inheritIO))
       (.start)))
 
+(def ^:redef repls [])
+
+(defn kill-java [ec2] (binding [bt/*sh-ret* :map] (ssh ec2 "pkill" "java")))
+
+(defrecord ReplProcess [ec2 ^Process fwd-process]
+  Closeable
+  (close [_]
+    (.destroy fwd-process)
+    (kill-java ec2)))
+
 (defn repl [ec2]
-  (let [repl-p nil
-        #_(doto (ProcessBuilder.
-                (->> (concat
-                       (ssh-remote-cmd ec2)
-                       ["java"
-                        "-Dclojure.server.repl=\"{:port 5555, :accept clojure.core.server/repl}\""
-                        "-jar" "sut.jar"
-                        "-e" (pr-str (pr-str '(let [o (Object.)] (try (locking o (.wait o)) (catch InterruptedException _)))))])
-                     (vec)))
-          (.inheritIO)
+  (let [_
+        (->
+          (ProcessBuilder.
+            (->> (concat
+                   (ssh-cmd ec2)
+                   ["java"
+                    "-Dclojure.server.repl=\"{:port 5555, :accept clojure.core.server/repl}\""
+                    "-jar" "sut.jar"
+                    "-e" (pr-str (pr-str '(let [o (Object.)]
+                                            (try
+                                              (locking o (.wait o))
+                                              (catch InterruptedException _)))))])
+                 (vec)))
+          (doto (.inheritIO))
           (.start))
 
-        remote-p
-        (ssh-remote-tunnel (assoc ec2 :local-port 5555, :remote-port 5555))]
+        fwd-proc
+        (ssh-fwd (assoc ec2 :local-port 5555, :remote-port 5555))]
 
+    (bt/log "Forwarded localhost:5555 to the ec2 box, connect to it as a socket REPL.")
 
-    {:remote-p remote-p,
-     :repl-p repl-p}))
+    (let [ret (->ReplProcess ec2 fwd-proc)]
+      (alter-var-root #'repls conj ret)
+      ret)))
+
+(defn provision
+  [id {:keys [ami, instance]
+       :or {ami "ami-0ee415e1b8b71305f"
+            instance "m1.small"}}]
+  (let [wait-duration (Duration/ofMinutes 5)
+        sleep-duration (Duration/ofSeconds 30)
+        stack (atom nil)
+        poll-stack #(reset! stack (cfn-stack-describe id))]
+
+    (cfn-stack-create {:ami ami, :instance instance} id)
+
+    (bt/log "Waiting for stack, this may take a while")
+    (bt/log "  id:" id)
+
+    (loop [wait-until (+ (System/currentTimeMillis) (.toMillis wait-duration))]
+      (Thread/sleep (.toMillis sleep-duration))
+      (poll-stack)
+      (when-not (= "CREATE_COMPLETE" (get @stack "StackStatus"))
+        (when (< (System/currentTimeMillis) wait-until)
+          (recur wait-until))))
+
+    (when-not (= "CREATE_COMPLETE" (get @stack "StackStatus"))
+      (throw (ex-info "Timed out waiting for stack" {:stack-timeout true :stack-name id})))
+
+    (bt/log "Stack created")
+    (bt/log "  id:" id)
+
+    @stack))
+
+(defn handle ^Ec2Handle [stack]
+  (let [{id "StackName"} stack]
+    (map->Ec2Handle (merge {:id id, :stack stack} (ssh-remote stack)))))

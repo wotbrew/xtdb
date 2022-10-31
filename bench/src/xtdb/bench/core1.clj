@@ -4,13 +4,16 @@
             [xtdb.bus :as bus]
             [xtdb.bench2 :as b2]
             [xtdb.bench.tools :as bt]
+            [xtdb.bench.ec2 :as ec2]
             [xtdb.io :as xio]
             [clojure.java.io :as io]
             [clojure.java.shell :as sh])
   (:import (io.micrometer.core.instrument MeterRegistry Timer Tag Timer$Sample)
            (java.time Duration)
            (java.util.concurrent.atomic AtomicLong)
-           (java.io Closeable)))
+           (java.io Closeable File)))
+
+(set! *warn-on-reflection* false)
 
 (defn generate [worker f n]
   (let [doc-seq (repeatedly n (partial f worker))
@@ -205,28 +208,30 @@
 (defn sha-artifacts-exist-in-m2? [sha]
   (.exists (io/file (System/getenv "HOME") ".m2" "repository" "com" "xtdb" "xtdb-core" sha)))
 
-(defn sut-lein-project [{:keys [sha, index, log, docs]}]
+(defn sut-module-deps [{:keys [sha, index, log, docs]}]
+  (distinct
+    (for [impl [index, log, docs]
+          [nm ver :as dep] (case impl
+                             :rocks [['com.xtdb/xtdb-rocksdb]]
+                             :lmdb [['com.xtdb/xtdb-lmdb]])]
+      (if ver dep [nm sha]))))
+
+(defn sut-lein-project [{:keys [sha] :as sut}]
   (list
     'defproject 'sut "0-SNAPSHOT"
     :dependencies
     (vec
       (concat [['com.xtdb/xtdb-bench "dev-SNAPSHOT" :exclusions ['com.xtdb]]
                ['com.xtdb/xtdb-core sha]]
-              (distinct
-                (for [impl [index, log, docs]
-                      [nm ver :as dep] (case impl
-                                         :rocks [['com.xtdb/xtdb-rocksdb]]
-                                         :lmdb [['com.xtdb/xtdb-lmdb]])]
-                  (if ver dep [nm sha])))))
-    :aot ['xtdb.bench.main2]))
+              (sut-module-deps sut)))))
 
 (defn install-self-to-m2 []
   (bt/sh-ctx
     {:dir "bench"}
     (bt/sh "lein" "install")))
 
-(defn provide-sut-requirements [sut & {:keys [use-existing-dev-snapshot]}]
-  (let [{:keys [jar, repository, sha]} sut]
+(defn build-sut-jar [sut]
+  (let [{:keys [repository, sha, use-existing-dev-snapshot]} sut]
     (assert (nil? sh/*sh-dir*) "must be in xtdb project dir!")
 
     (when-not use-existing-dev-snapshot
@@ -240,11 +245,32 @@
     (bt/log "Building sut.jar")
     (let [proj-form (sut-lein-project sut)
           tmp-dir (xio/create-tmpdir "sut-lein")
-          jar-local (io/file tmp-dir "target" "sut-0-SNAPSHOT-standalone.jar")]
+          jar-file (io/file tmp-dir "target" "sut-0-SNAPSHOT-standalone.jar")]
       (spit (io/file tmp-dir "project.clj") (pr-str proj-form))
       (bt/sh-ctx {:dir tmp-dir} (bt/sh "lein" "uberjar"))
-      (bt/log "Providing sut.jar")
-      (bt/copy {:t :file, :file jar-local} jar))))
+      jar-file)))
+
+(defn provide-sut-requirements [sut]
+  (let [{:keys [jar]} sut
+        jar-local (build-sut-jar sut)]
+    (bt/copy {:t :file, :file jar-local} jar)))
+
+(defn prep [{:keys [sut]}]
+  (let [node-opts (sut-node-opts sut)]
+    {:start #(xt/start-node node-opts)
+     :hook wrap-task}))
+
+(defn run-benchmark
+  [{:keys [node-opts
+           benchmark-type
+           benchmark-opts]}]
+  (let [benchmark
+        (case benchmark-type
+          :auctionmark
+          ((requiring-resolve 'xtdb.bench.auctionmark/benchmark) benchmark-opts))
+        benchmark-fn (b2/compile-benchmark benchmark wrap-task)]
+    (with-open [node (xt/start-node node-opts)]
+      (benchmark-fn node))))
 
 (defn sut-node-opts [{:keys [index, log, docs]}]
   (let [rocks-kv (fn [] {:xtdb/module 'xtdb.rocksdb/->kv-store,
@@ -257,7 +283,101 @@
      :xtdb/document-store {:kv-store (case docs :rocks (rocks-kv) :lmdb (lmdb-kv))}
      :xtdb/index-store {:kv-store (case index :rocks (rocks-kv) :lmdb (lmdb-kv))}}))
 
-(defn prep [{:keys [sut]}]
-  (let [node-opts (sut-node-opts sut)]
-    {:start #(xt/start-node node-opts)
-     :hook wrap-task}))
+(defn build-jar
+  [{:keys [repository
+           version
+           index
+           docs
+           log
+           sha
+           use-existing-dev-snapshot]
+    :or {repository "git@github.com:xtdb/xtdb.git"
+         version "master"
+         index :rocks
+         docs :rocks
+         log :rocks}}]
+  (let [sha (or sha (bt/resolve-sha repository version))]
+    (assert (nil? sh/*sh-dir*) "must be in xtdb project dir!")
+
+    (when-not use-existing-dev-snapshot
+      (bt/log "Installing current bench sources to ~/.m2")
+      (install-self-to-m2))
+
+    (when-not (sha-artifacts-exist-in-m2? sha)
+      (bt/log "Installing target sha to ~/.m2")
+      (install-sha-artifacts-to-m2 repository sha))
+
+    (bt/log "Building sut.jar")
+    (let [proj-form (sut-lein-project
+                      {:sha sha
+                       :version version
+                       :index index
+                       :docs docs
+                       :log log})
+          tmp-dir (xio/create-tmpdir "sut-lein")
+          jar-file (io/file tmp-dir "target" "sut-0-SNAPSHOT-standalone.jar")]
+      (spit (io/file tmp-dir "project.clj") (pr-str proj-form))
+      (bt/sh-ctx {:dir tmp-dir} (bt/sh "lein" "uberjar"))
+      jar-file)))
+
+;; use s3 for the jar rather than scp, so you do not have to upload it multiple times (s3 to ec2 is fast, rural broadband less so)
+;; another cool thing is maybe put to path by content hash and diff to avoid upload if needed
+(defn s3-upload-jar [jar-file jar-s3-path]
+  (bt/aws "s3" "cp" (.getAbsolutePath (io/file jar-file)) jar-s3-path))
+
+(defn ec2-setup [ec2 s3-jar-path]
+  (ec2/await-ssh ec2)
+  (ec2/install-packages ec2 ["awscli" "java-17-amazon-corretto-headless"])
+  (ec2/ssh ec2 "aws" "s3" "cp" s3-jar-path "sut.jar"))
+
+(def ^:redef ec2-repls [])
+
+(defn kill-java [ec2]
+  (binding [bt/*sh-ret* :map]
+    (ec2/ssh ec2 "pkill" "java")))
+
+(defrecord Ec2ReplProcess [ec2 ^Process fwd-process]
+  Closeable
+  (close [_]
+    (.destroy fwd-process)
+    (kill-java ec2)))
+
+(defn ec2-repl [ec2]
+  (let [_
+        (->
+          (ProcessBuilder.
+            (->> (concat
+                   (ec2/ssh-cmd ec2)
+                   ["java"
+                    "-Dclojure.server.repl=\"{:port 5555, :accept clojure.core.server/repl}\""
+                    "-jar" "sut.jar"
+                    "-e" (pr-str (pr-str '(let [o (Object.)]
+                                            (try
+                                              (locking o (.wait o))
+                                              (catch InterruptedException _)))))])
+                 (vec)))
+          (doto (.inheritIO))
+          (.start))
+
+        fwd-proc
+        (ec2/ssh-fwd (assoc ec2 :local-port 5555, :remote-port 5555))]
+
+    (bt/log "Forwarded localhost:5555 to the ec2 box, connect to it as a socket REPL.")
+
+    (let [ret (->Ec2ReplProcess ec2 fwd-proc)]
+      (alter-var-root #'ec2-repls conj ret)
+      ret)))
+
+(defn ec2-eval [ec2 & code]
+  (ec2/ssh ec2 "java" "-jar" "sut.jar" "-e" (pr-str (pr-str (list* 'do code)))))
+
+(defn ec2-run-benchmark* [run-benchmark-opts report-s3-path]
+  (let [report (run-benchmark run-benchmark-opts)
+        tmp-file (File/createTempFile "report" ".edn")]
+    (spit tmp-file (pr-str report))
+    (bt/aws "s3" "cp" (.getAbsolutePath tmp-file) report-s3-path)))
+
+(defn ec2-run-benchmark [ec2 run-benchmark-opts report-s3-path]
+  (ec2-eval
+    ec2
+    `((requiring-resolve 'xtdb.bench.core1/ec2-run-benchmark*) ~run-benchmark-opts ~report-s3-path)))

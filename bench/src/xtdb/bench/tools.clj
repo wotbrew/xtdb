@@ -50,17 +50,23 @@
 
 (defmacro sh-ctx [opts & body] `(sh-ctx* ~opts (fn [] ~@body)))
 
+(def ^:dynamic *sh-ret* :out)
+
 (defn sh [& args]
   (let [command-str (str/join " " args)
         _ (println "  $" command-str)
-        {:keys [exit, err, out]} (apply sh/sh args)]
-    (when-not (= 0 exit)
-      (throw (ex-info (or (not-empty out) "Command failed")
-                      {:command command-str
-                       :exit exit
-                       :out out
-                       :err err})))
-    out))
+        {:keys [exit, err, out] :as m} (apply sh/sh args)]
+    (case *sh-ret*
+      :out
+      (do
+        (when-not (= 0 exit)
+          (throw (ex-info (or (not-empty out) "Command failed")
+                          {:command command-str
+                           :exit exit
+                           :out out
+                           :err err})))
+        out)
+      :map m)))
 
 (def probably-running-in-ec2 (= "ec2-user" (System/getenv "USER")))
 
@@ -148,7 +154,8 @@
         (try
           (spit tmp (pr-str out))
           (copy {:t :file, :file tmp} report)
-          (finally (.delete tmp)))))))
+          (finally (.delete tmp))))
+      nil)))
 
 (defn setup! [req]
   (let [{:keys [manifest, sut, env] :as resolved} (resolve-req req)

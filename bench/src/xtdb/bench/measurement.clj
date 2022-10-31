@@ -87,11 +87,11 @@
         sample-freq
         TimeUnit/MILLISECONDS)
       (try
-        (let [start-ns (System/nanoTime)]
+        (let [start-ms (System/currentTimeMillis)]
           (f worker)
           (b2/add-report worker {:stage k,
-                                 :start-ns start-ns
-                                 :end-ns (System/nanoTime)
+                                 :start-ms start-ms
+                                 :end-ms (System/currentTimeMillis)
                                  :metrics (sampler :summarize)}))
         (finally
           (.shutdownNow executor))))))
