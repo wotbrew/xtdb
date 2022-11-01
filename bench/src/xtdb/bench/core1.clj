@@ -51,8 +51,8 @@
 
         _
         (doto meter-reg
-          (.gauge "node.tx" ^Iterable (Tag/of "event" "submitted") submit-counter)
-          (.gauge "node.tx" ^Iterable (Tag/of "event" "indexed") indexed-counter)
+          (.gauge "node.tx" ^Iterable [(Tag/of "event" "submitted")] submit-counter)
+          (.gauge "node.tx" ^Iterable [(Tag/of "event" "indexed")] indexed-counter)
           (.gauge "node.indexed.docs" indexed-docs-counter)
           (.gauge "node.indexed.bytes" indexed-bytes-counter)
           (.gauge "node.indexed.av" indexed-av-counter))
@@ -258,8 +258,26 @@
 
 (defn prep [{:keys [sut]}]
   #_(let [node-opts (sut-node-opts sut)]
-    {:start #(xt/start-node node-opts)
-     :hook wrap-task}))
+      {:start #(xt/start-node node-opts)
+       :hook wrap-task}))
+
+(defn undata-node-opts [{:keys [index, log, docs]}]
+  (let [rocks-kv (fn [] {:xtdb/module 'xtdb.rocksdb/->kv-store,
+                         :db-dir (xio/create-tmpdir "kv")
+                         :db-dir-suffix "kv"})
+        lmdb-kv (fn [] {:xtdb/module 'xtdb.lmdb/->kv-store,
+                        :db-dir (xio/create-tmpdir "kv")
+                        :db-dir-suffix "kv"})
+        undata (fn [t]
+               (case t
+                 nil {}
+                 :rocks
+                 {:kv-store (rocks-kv)}
+                 :lmdb
+                 {:kv-store (lmdb-kv)}))]
+    {:xtdb/tx-log (undata log)
+     :xtdb/document-store (undata docs)
+     :xtdb/index-store (undata index)}))
 
 (defn run-benchmark
   [{:keys [node-opts
@@ -270,19 +288,8 @@
           :auctionmark
           ((requiring-resolve 'xtdb.bench.auctionmark/benchmark) benchmark-opts))
         benchmark-fn (b2/compile-benchmark benchmark wrap-task)]
-    (with-open [node (xt/start-node node-opts)]
+    (with-open [node (xt/start-node (undata-node-opts node-opts))]
       (benchmark-fn node))))
-
-(defn sut-node-opts [{:keys [index, log, docs]}]
-  (let [rocks-kv (fn [] {:xtdb/module 'xtdb.rocksdb/->kv-store,
-                         :db-dir-suffix "kv"
-                         :db-dir (xio/create-tmpdir "bench")})
-        lmdb-kv (fn [] {:xtdb/module 'xtdblmdb/->kv-store,
-                        :db-dir-suffix "kv"
-                        :db-dir (xio/create-tmpdir "bench")})]
-    {:xtdb/tx-log {:kv-store (case log :rocks (rocks-kv) :lmdb (lmdb-kv))}
-     :xtdb/document-store {:kv-store (case docs :rocks (rocks-kv) :lmdb (lmdb-kv))}
-     :xtdb/index-store {:kv-store (case index :rocks (rocks-kv) :lmdb (lmdb-kv))}}))
 
 (defn build-jar
   [{:keys [repository
@@ -391,25 +398,38 @@
 
   ;; easy!
 
-  (def report1
+  (def report1-rocks
     (run-benchmark
-      {:node-opts {}
+      {:node-opts {:index :rocks, :log :rocks, :docs :rocks}
        :benchmark-type :auctionmark
        :benchmark-opts {:duration "PT30S"}}))
 
   (require 'xtdb.bench.report)
   (xtdb.bench.report/show-html-report
     (xtdb.bench.report/vs
-      "Report1"
-      report1))
+      "Rocks"
+      report1-rocks))
 
+  (def report1-lmdb
+    (run-benchmark
+      {:node-opts {:index :lmdb, :log :lmdb, :docs :lmdb}
+       :benchmark-type :auctionmark
+       :benchmark-opts {:duration "PT30S"}}))
+
+  (xtdb.bench.report/show-html-report
+    (xtdb.bench.report/vs
+      "Rocks"
+      report1-rocks
+      "LMDB"
+      report1-lmdb))
 
   ;; ======
   ;; Running in EC2
   ;; ======
 
   ;; step 1 build system-under-test .jar
-  (def jar-file (build-jar {:version "1.22.0"}))
+  ;; todo just supply modules you want rather than the data-opts
+  (def jar-file (build-jar {:version "1.22.0", :index :rocks, :log :rocks, :docs :rocks}))
   (def jar-s3-path (format "s3://xtdb-bench/b2/jar/%s.jar" ec2-stack-id))
 
   ;; make jar available to download for ec2 nodes
@@ -417,7 +437,7 @@
 
   ;; step 2 provision resources
   (def ec2-stack-id (str "bench-" (System/currentTimeMillis)))
-  (def ec2-stack (ec2/provision ec2-stack-id))
+  (def ec2-stack (ec2/provision ec2-stack-id {:instance "m1.small"}))
   (def ec2 (ec2/handle ec2-stack))
 
   ;; step 3 setup ec2 for running core1 benchmarks against sut.jar
@@ -426,21 +446,23 @@
   ;; step 4 run your benchmark
   (def report-s3-path (format "s3://xtdb-bench/b2/report/%s.edn" ec2-stack-id))
 
+  ;; todo java opts
   (ec2-run-benchmark
     ec2
-    {:node-opts {}
+    {:node-opts {:index :rocks, :log :rocks, :docs :rocks}
      :benchmark-type :auctionmark
      :benchmark-opts {:duration "PT30S"}}
     report-s3-path)
 
+  ;; step 5 get your report
+
   (def report-file (File/createTempFile "report" ".edn"))
+
   (bt/aws "s3" "cp" report-s3-path (.getAbsolutePath report-file))
 
-  ;; step 5 get your report
   (def report2 (edn/read-string (slurp report-file)))
 
   ;; step 6 visualise your report
-  ;; TODO PORT VEGA CODE
 
   (require 'xtdb.bench.report)
   (xtdb.bench.report/show-html-report
@@ -448,17 +470,17 @@
       "Report2"
       report2))
 
-  ;; compare to the earlier in-process report (now imagine running on n nodes)
+  ;; compare to the earlier in-process report (now imagine running on n nodes with different configs)
   (xtdb.bench.report/show-html-report
     (xtdb.bench.report/vs
       "On laptop"
-      report1
+      report1-rocks
       "In EC2"
       report2))
 
   ;; filter reports to just :oltp stage
   (let [filter-report #(xtdb.bench.report/stage-only % :oltp)
-        report1 (filter-report report1)
+        report1 (filter-report report1-rocks)
         report2 (filter-report report2)]
     (xtdb.bench.report/show-html-report
       (xtdb.bench.report/vs
@@ -467,9 +489,27 @@
         "In EC2"
         report2)))
 
-  ;; CLEANUP! delete your node when finished, later might tag with a max-duration and (ec2/gc)
+  ;; ===
+  ;; EC2 misc
+  ;; ===
+  ;; misc tools:
+  ;; you can open a repl if something is wrong (close with .close), right now needs 5555 locally to forward over ssh
+  (def repl (ec2-repl ec2))
+  (.close repl)
+
+  ;; if you lose a handle get it again from the stack
+  (ec2/handle (ec2/cfn-stack-describe bench-id))
+
+  ;; run something over ssh
+  (ec2/ssh ec2 "ls" "-la")
+
+  ;; kill the java process!
+  (kill-java ec2)
+
+  ;; find stacks starting "bench-"
+  (ec2/cfn-stack-ls)
+
+  ;; CLEANUP! delete your node when finished with it
   (ec2/cfn-stack-delete ec2-stack-id)
-
-
 
   )

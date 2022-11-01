@@ -113,11 +113,11 @@
 
         [:div
          [:table
-          [:thead [:th "config"] [:th "arch"] [:th "os"] [:th "cpu"] [:th "memory"]]
+          [:thead [:th "config"] [:th "jre"] [:th "arch"] [:th "os"] [:th "cpu"] [:th "memory"]]
           [:tbody
            (for [{:keys [label, system]} (:systems report)
-                 :let [{:keys [arch, os, cpu, memory]} system]]
-             [:tr [:th label] [:td arch] [:td os] [:td cpu] [:td memory]])]]]
+                 :let [{:keys [jre, arch, os, cpu, memory]} system]]
+             [:tr [:th label] [:td jre] [:td arch] [:td os] [:td cpu] [:td memory]])]]]
 
         [:div
          (for [[group metric-data] (sort-by key (group-metrics report))]

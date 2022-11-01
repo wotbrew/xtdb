@@ -88,7 +88,7 @@
         TimeUnit/MILLISECONDS)
       (try
         (let [start-ms (System/currentTimeMillis)]
-          (f worker)
+          (binding [*stage-reg* reg] (f worker))
           (.shutdownNow executor)
           (when-not (.awaitTermination executor 1000 TimeUnit/MILLISECONDS)
             (throw (ex-info "Could not shut down sampler executor in time" {:stage k})))

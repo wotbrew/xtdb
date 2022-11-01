@@ -108,7 +108,7 @@
     (.interrupt thread)))
 
 (defn get-system-info
-  "Returns data about the hardware / OS running this JVM."
+  "Returns data about the JVM, hardware / OS running this JVM."
   []
   (let [si (SystemInfo.)
         os (.getOperatingSystem si)
@@ -123,7 +123,8 @@
         cpu-core-count (.getPhysicalProcessorCount cpu)
         cpu-max-freq (.getMaxFreq cpu)
         ram (.getMemory hardware)]
-    {:arch arch
+    {:jre (System/getProperty "java.vendor.version")
+     :arch arch
      :os (str/join " " (remove str/blank? [(.getFamily os) os-codename os-version-number]))
      :memory (format "%sGB" (quot (long (.getTotal ram)) (* 1024 1024 1024)))
      :cpu (format "%s, %s cores, %.2fGHZ max" cpu-name cpu-core-count (double (/ cpu-max-freq 1e9)))}))
@@ -247,9 +248,9 @@
       {:seed 0
        :tasks [{:t :call,
                 :stage :foo
-                ;; receives system-under test, this arg will be threaded through when the benchmark
+                ;; receives system-under test under :sut, this arg will be threaded through when the benchmark
                 ;; is eval'd, e.g an xt node.
-                :f (fn [_sut] (Thread/sleep 100))}]}
+                :f (fn [_worker] (Thread/sleep 100))}]}
       ;; middleware hook for injecting measurement, proxies and what not
       (fn [_task f] f)))
 
@@ -261,9 +262,7 @@
      {:seed 0
       :tasks [{:t :call,
                :stage :foo
-               ;; receives system-under test, this arg will be threaded through when the benchmark
-               ;; is eval'd, e.g an xt node.
-               :f (fn [_sut] (Thread/sleep 100))}]}
+               :f (fn [_worker] (Thread/sleep 100))}]}
      ;; can use measurement to wrap stages/transactions with metrics
      @(requiring-resolve `xtdb.bench.measurement/wrap-task))
    42))
