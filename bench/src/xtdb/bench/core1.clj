@@ -7,7 +7,8 @@
             [xtdb.bench.ec2 :as ec2]
             [xtdb.io :as xio]
             [clojure.java.io :as io]
-            [clojure.java.shell :as sh])
+            [clojure.java.shell :as sh]
+            [clojure.edn :as edn])
   (:import (io.micrometer.core.instrument MeterRegistry Timer Tag Timer$Sample)
            (java.time Duration)
            (java.util.concurrent.atomic AtomicLong)
@@ -256,7 +257,7 @@
     (bt/copy {:t :file, :file jar-local} jar)))
 
 (defn prep [{:keys [sut]}]
-  (let [node-opts (sut-node-opts sut)]
+  #_(let [node-opts (sut-node-opts sut)]
     {:start #(xt/start-node node-opts)
      :hook wrap-task}))
 
@@ -381,3 +382,67 @@
   (ec2-eval
     ec2
     `((requiring-resolve 'xtdb.bench.core1/ec2-run-benchmark*) ~run-benchmark-opts ~report-s3-path)))
+
+
+(comment
+  ;; ======
+  ;; Running in process
+  ;; ======
+
+  ;; easy!
+
+  (def report1
+    (run-benchmark
+      ec2
+      {:node-opts {}
+       :benchmark-type :auctionmark
+       :benchmark-opts {:duration "PT30S"}}))
+
+
+  ;; ======
+  ;; Running in EC2
+  ;; ======
+
+  ;; step 1 build system-under-test .jar
+  (def jar-file (build-jar {:version "1.22.0"}))
+  (def jar-s3-path (format "s3://xtdb-bench/b2/jar/%s.jar" ec2-stack-id))
+
+  ;; make jar available to download for ec2 nodes
+  (s3-upload-jar jar-file jar-s3-path)
+
+  ;; step 2 provision resources
+  (def ec2-stack-id (str "bench-" (System/currentTimeMillis)))
+  (def ec2-stack (ec2/provision ec2-stack-id))
+  (def ec2 (ec2/handle ec2-stack))
+
+  ;; step 3 setup ec2 for running core1 benchmarks against sut.jar
+  (ec2-setup ec2 jar-s3-path)
+
+  ;; step 4 run your benchmark
+  (def report-s3-path (format "s3://xtdb-bench/b2/report/%s.edn" ec2-stack-id))
+
+  (ec2-run-benchmark
+    ec2
+    {:node-opts {}
+     :benchmark-type :auctionmark
+     :benchmark-opts {:duration "PT30S"}}
+    report-s3-path)
+
+  (def report-file (File/createTempFile "report" ".edn"))
+  (bt/aws "s3" "cp" report-s3-path (.getAbsolutePath report-file))
+
+  ;; step 5 get your report
+  (def report2 (edn/read-string (slurp report-file)))
+
+  ;; step 6 visualise your report
+  ;; TODO PORT VEGA CODE
+
+
+
+
+  ;; CLEANUP! delete your node when finished, later might tag with a max-duration and (ec2/gc)
+  (ec2/cfn-stack-delete ec2-stack-id)
+
+
+
+  )

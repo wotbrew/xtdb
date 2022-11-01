@@ -97,8 +97,8 @@
    "-i" (.getAbsolutePath (io/file key-file))
    (str user "@" host)])
 
-(defn ssh [ssh-remote cmd & cmd-args]
-  (apply bt/sh (concat (ssh-cmd ssh-remote) [cmd] cmd-args)))
+(defn ssh [ec2 cmd & cmd-args]
+  (apply bt/sh (concat (ssh-cmd ec2) [cmd] cmd-args)))
 
 (defn aws-id [epoch-ms]
   (str "bench-" (-> (LocalDateTime/ofInstant (Instant/ofEpochMilli epoch-ms)
