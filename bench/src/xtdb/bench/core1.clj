@@ -393,10 +393,15 @@
 
   (def report1
     (run-benchmark
-      ec2
       {:node-opts {}
        :benchmark-type :auctionmark
        :benchmark-opts {:duration "PT30S"}}))
+
+  (require 'xtdb.bench.report)
+  (xtdb.bench.report/show-html-report
+    (xtdb.bench.report/vs
+      "Report1"
+      report1))
 
 
   ;; ======
@@ -437,6 +442,19 @@
   ;; step 6 visualise your report
   ;; TODO PORT VEGA CODE
 
+  (require 'xtdb.bench.report)
+  (xtdb.bench.report/show-html-report
+    (xtdb.bench.report/vs
+      "Report2"
+      report2))
+
+  ;; compare to the earlier in-process report (now imagine running on n nodes)
+  (xtdb.bench.report/show-html-report
+    (xtdb.bench.report/vs
+      "On laptop"
+      report1
+      "In EC2"
+      report2))
 
 
 

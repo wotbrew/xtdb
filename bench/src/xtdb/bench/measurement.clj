@@ -89,6 +89,9 @@
       (try
         (let [start-ms (System/currentTimeMillis)]
           (f worker)
+          (.shutdownNow executor)
+          (when-not (.awaitTermination executor 1000 TimeUnit/MILLISECONDS)
+            (throw (ex-info "Could not shut down sampler executor in time" {:stage k})))
           (b2/add-report worker {:stage k,
                                  :start-ms start-ms
                                  :end-ms (System/currentTimeMillis)
