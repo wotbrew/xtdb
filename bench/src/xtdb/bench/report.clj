@@ -5,63 +5,73 @@
             [clojure.java.io :as io])
   (:import (java.io File)))
 
+(defn stage-points [metric-data]
+  (into (sorted-map)
+        (for [[stage metric-data] (group-by :stage metric-data)
+              :let [first-samples (keep (comp first :samples) metric-data)
+                    earliest-sample (reduce min Long/MAX_VALUE (map :time-ms first-samples))]]
+          [stage earliest-sample])))
+
 ;; use vega to plot metrics for now
 ;; works at repl, no servers needed
 ;; if this approach takes of the time series data wants to be graphed in something like a shared prometheus / grafana during run
 (defn vega-plots [metric-data]
-  (vec
-    (for [[metric metric-data] (sort-by key (group-by :metric metric-data))]
-      {:title metric
-       :hconcat (vec (for [[[_statistic unit] metric-data] (sort-by key (group-by (juxt :statistic :unit) metric-data))
-                           :let [data {:values (vec (for [{:keys [vs-label, series, samples]} metric-data
-                                                          {:keys [time-ms, value]} samples
-                                                          :when (Double/isFinite value)]
-                                                      {:time (str time-ms)
-                                                       :config vs-label
-                                                       :series series
-                                                       :value value}))
-                                       :format {:parse {:time "utc:'%Q'"}}}
-                                 any-series (some (comp not-empty :series) metric-data)
+  (let [stage-time-points (stage-points metric-data)]
+    (vec
+      (for [[[stage metric] metric-data]
+            (sort-by (fn [[[stage metric]]] [(stage-time-points stage) metric])
+                     (group-by (juxt :stage :metric) metric-data))]
+        {:title (str stage " " metric)
+         :hconcat (vec (for [[[_statistic unit] metric-data] (sort-by key (group-by (juxt :statistic :unit) metric-data))
+                             :let [data {:values (vec (for [{:keys [vs-label, series, samples]} metric-data
+                                                            {:keys [time-ms, value]} samples
+                                                            :when (Double/isFinite value)]
+                                                        {:time (str time-ms)
+                                                         :config vs-label
+                                                         :series series
+                                                         :value value}))
+                                         :format {:parse {:time "utc:'%Q'"}}}
+                                   any-series (some (comp not-empty :series) metric-data)
 
-                                 series-dimension (and any-series (< 1 (count metric-data)))
-                                 vs-dimension (= 2 (bounded-count 2 (keep :vs-label metric-data)))
+                                   series-dimension (and any-series (< 1 (count metric-data)))
+                                   vs-dimension (= 2 (bounded-count 2 (keep :vs-label metric-data)))
 
-                                 stack-series series-dimension
-                                 stack-vs (and (not stack-series) vs-dimension)
-                                 facet-vs (and vs-dimension (not stack-vs))
+                                   stack-series series-dimension
+                                   stack-vs (and (not stack-series) vs-dimension)
+                                   facet-vs (and vs-dimension (not stack-vs))
 
-                                 layer-instead-of-stack
-                                 (cond stack-series (str/ends-with? metric "percentile value")
-                                       stack-vs true)
+                                   layer-instead-of-stack
+                                   (cond stack-series (str/ends-with? metric "percentile value")
+                                         stack-vs true)
 
-                                 mark-type (if stack-vs "line" "area")
+                                   mark-type (if stack-vs "line" "area")
 
-                                 spec {:mark {:type mark-type, :line true, :tooltip true}
-                                       :encoding {:x {:field "time"
-                                                      :type "temporal"
-                                                      :title "Time"}
-                                                  :y (let [y {:field "value"
-                                                              :type "quantitative"
-                                                              :title (or unit "Value")}]
-                                                       (if layer-instead-of-stack
-                                                         (assoc y :stack false)
-                                                         y))
-                                                  :color
-                                                  (cond
-                                                    stack-series
-                                                    {:field "series",
-                                                     :legend {:labelLimit 280}
-                                                     :type "nominal"}
-                                                    stack-vs
-                                                    {:field "config",
-                                                     :legend {:labelLimit 280}
-                                                     :type "nominal"})}}]]
-                       (if facet-vs
-                         {:data data
-                          :facet {:column {:field "config"}
-                                  :header {:title nil}}
-                          :spec spec}
-                         (assoc spec :data data))))})))
+                                   spec {:mark {:type mark-type, :line true, :tooltip true}
+                                         :encoding {:x {:field "time"
+                                                        :type "temporal"
+                                                        :title "Time"}
+                                                    :y (let [y {:field "value"
+                                                                :type "quantitative"
+                                                                :title (or unit "Value")}]
+                                                         (if layer-instead-of-stack
+                                                           (assoc y :stack false)
+                                                           y))
+                                                    :color
+                                                    (cond
+                                                      stack-series
+                                                      {:field "series",
+                                                       :legend {:labelLimit 280}
+                                                       :type "nominal"}
+                                                      stack-vs
+                                                      {:field "config",
+                                                       :legend {:labelLimit 280}
+                                                       :type "nominal"})}}]]
+                         (if facet-vs
+                           {:data data
+                            :facet {:column {:field "config"}
+                                    :header {:title nil}}
+                            :spec spec}
+                           (assoc spec :data data))))}))))
 
 (defn group-metrics [rs]
   (let [{:keys [metrics]} rs
@@ -150,7 +160,9 @@
      :systems (for [label key-seq] {:label label, :system (:system (report-map label))})
      :metrics (vec (for [[i label] (map-indexed vector key-seq)
                          report (:reports (report-map label))
-                         :when (= :oltp (:stage report))
-                         :let [{:keys [metrics]} (normalize-time report)]
+                         :let [{:keys [stage, metrics]} (normalize-time report)]
                          metric metrics]
-                     (assoc metric :vs-label (str label))))}))
+                     (assoc metric :vs-label (str label), :stage stage)))}))
+
+(defn stage-only [report stage]
+  (update report :reports (partial filterv #(= stage (:stage %)))))

@@ -456,7 +456,16 @@
       "In EC2"
       report2))
 
-
+  ;; filter reports to just :oltp stage
+  (let [filter-report #(xtdb.bench.report/stage-only % :oltp)
+        report1 (filter-report report1)
+        report2 (filter-report report2)]
+    (xtdb.bench.report/show-html-report
+      (xtdb.bench.report/vs
+        "On laptop"
+        report1
+        "In EC2"
+        report2)))
 
   ;; CLEANUP! delete your node when finished, later might tag with a max-duration and (ec2/gc)
   (ec2/cfn-stack-delete ec2-stack-id)
