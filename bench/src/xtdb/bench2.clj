@@ -1,7 +1,7 @@
 (ns xtdb.bench2
   (:require [clojure.string :as str])
   (:import (java.util.concurrent.atomic AtomicLong)
-           (java.util.concurrent ConcurrentHashMap)
+           (java.util.concurrent ConcurrentHashMap Executors TimeUnit)
            (java.util Random Comparator)
            (com.google.common.collect MinMaxPriorityQueue)
            (java.util.function Function)
@@ -21,8 +21,8 @@
 (defn current-timestamp-ms ^long [worker] (.millis ^Clock (:clock worker)))
 
 (defn id
-  "Defines some function of a continuous integer domain, literally just identity, but with uh... identity, e.g
-   the function returned is a different closure every time."
+  "Returns an identity fn. Would be _the identity_ but with uh... identity, e.g
+   the function returned is a new java object on each call."
   []
   (fn [n] n))
 
@@ -99,14 +99,6 @@
     (let [idx (.nextInt (rng worker) (count coll))]
       (nth coll idx nil))))
 
-(defn- await-threads [threads ^Duration wait]
-  (when-some [^Thread t (first threads)]
-    (.join t (.toMillis wait)))
-
-  ;; warn/alert?
-  (doseq [^Thread thread (filter #(.isAlive ^Thread %) threads)]
-    (.interrupt thread)))
-
 (defn get-system-info
   "Returns data about the JVM, hardware / OS running this JVM."
   []
@@ -159,6 +151,9 @@
                     sleep (if (pos? think-ms) #(Thread/sleep think-ms) (constantly nil))
                     f (compile-task pooled-task)
 
+                    executor
+                    (Executors/newFixedThreadPool thread-count)
+
                     thread-loop
                     (fn run-pool-thread-loop [worker]
                       (loop [wait-until (+ (current-timestamp-ms worker) (.toMillis duration))]
@@ -171,12 +166,13 @@
                     (fn [root-worker i]
                       (let [bindings (get-thread-bindings)
                             worker (assoc root-worker :random (Random. (.nextLong (rng root-worker))))]
-                        (doto (Thread. ^Runnable (fn [] (push-thread-bindings bindings) (thread-loop worker)))
-                          (.start))))]
+                        (.submit executor ^Runnable (fn [] (push-thread-bindings bindings) (thread-loop worker)))))]
 
                 (fn run-pool [worker]
-                  (let [running-threads (mapv #(start-thread worker %) (range thread-count))]
-                    (await-threads running-threads (.plus duration join-wait)))))
+                  (run! #(start-thread worker %) (range thread-count))
+                  (.shutdown executor)
+                  (when-not (.awaitTermination executor (.toMillis (.plus duration join-wait)) TimeUnit/MILLISECONDS)
+                    (throw (ex-info "Pool threads did not stop within duration+join-wait" {:task task, :executor executor})))))
 
               :concurrently
               (let [{:keys [^Duration duration,
@@ -184,15 +180,19 @@
                             thread-tasks]} task
 
                     thread-task-fns (mapv compile-task thread-tasks)
+
+                    executor (Executors/newFixedThreadPool (count thread-tasks))
+
                     start-thread
                     (fn [root-worker i f]
                       (let [bindings (get-thread-bindings)
                             worker (assoc root-worker :random (Random. (.nextLong (rng root-worker))))]
-                        (doto (Thread. ^Runnable (fn [] (push-thread-bindings bindings) (f worker)))
-                          (.start))))]
+                        (.submit executor ^Runnable (fn [] (push-thread-bindings bindings) (f worker)))))]
                 (fn run-concurrently [worker]
-                  (let [running-threads (vec (map-indexed #(start-thread worker %1 %2) thread-task-fns))]
-                    (await-threads running-threads (.plus duration join-wait)))))
+                  (dorun (map-indexed #(start-thread worker %1 %2) thread-task-fns))
+                  (.shutdown executor)
+                  (when-not (.awaitTermination executor (.toMillis (.plus duration join-wait)) TimeUnit/MILLISECONDS)
+                    (throw (ex-info "Task threads did not stop within duration+join-wait" {:task task, :executor executor})))))
 
               :pick-weighted
               (let [{:keys [choices]} task

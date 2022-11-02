@@ -392,7 +392,7 @@
 
   ;; easy!
 
-  (def run-duration "PT10M")
+  (def run-duration "PT30S")
 
   (def report1-rocks
     (run-benchmark
@@ -495,7 +495,7 @@
   (.close repl)
 
   ;; if you lose a handle get it again from the stack
-  (ec2/handle (ec2/cfn-stack-describe bench-id))
+  (def ec2 (ec2/handle (ec2/cfn-stack-describe ec2-stack-id)))
 
   ;; run something over ssh
   (ec2/ssh ec2 "ls" "-la")
