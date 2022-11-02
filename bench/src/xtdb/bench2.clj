@@ -169,8 +169,9 @@
 
                     start-thread
                     (fn [root-worker i]
-                      (let [worker (assoc root-worker :random (Random. (.nextLong (rng root-worker))))]
-                        (doto (Thread. ^Runnable (fn [] (thread-loop worker)))
+                      (let [bindings (get-thread-bindings)
+                            worker (assoc root-worker :random (Random. (.nextLong (rng root-worker))))]
+                        (doto (Thread. ^Runnable (fn [] (push-thread-bindings bindings) (thread-loop worker)))
                           (.start))))]
 
                 (fn run-pool [worker]
@@ -185,8 +186,9 @@
                     thread-task-fns (mapv compile-task thread-tasks)
                     start-thread
                     (fn [root-worker i f]
-                      (let [worker (assoc root-worker :random (Random. (.nextLong (rng root-worker))))]
-                        (doto (Thread. ^Runnable (fn [] (f worker)))
+                      (let [bindings (get-thread-bindings)
+                            worker (assoc root-worker :random (Random. (.nextLong (rng root-worker))))]
+                        (doto (Thread. ^Runnable (fn [] (push-thread-bindings bindings) (f worker)))
                           (.start))))]
                 (fn run-concurrently [worker]
                   (let [running-threads (vec (map-indexed #(start-thread worker %1 %2) thread-task-fns))]

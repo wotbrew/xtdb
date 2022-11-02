@@ -74,30 +74,35 @@
 (def percentiles
   [0.75 0.85 0.95 0.98 0.99 0.999])
 
-(defn wrap-stage [k f]
-  (fn instrumented-stage [worker]
-    (let [reg (meter-reg)
-          sampler (meter-sampler reg)
-          executor (Executors/newSingleThreadScheduledExecutor)
-          sample-freq 1000]
-      (.scheduleAtFixedRate
-        executor
-        ^Runnable sampler
-        0
+(defn wrap-stage [task f]
+  (let [stage (:stage task)
+        ^Duration duration (:duration task)
         sample-freq
-        TimeUnit/MILLISECONDS)
-      (try
-        (let [start-ms (System/currentTimeMillis)]
-          (binding [*stage-reg* reg] (f worker))
-          (.shutdownNow executor)
-          (when-not (.awaitTermination executor 1000 TimeUnit/MILLISECONDS)
-            (throw (ex-info "Could not shut down sampler executor in time" {:stage k})))
-          (b2/add-report worker {:stage k,
-                                 :start-ms start-ms
-                                 :end-ms (System/currentTimeMillis)
-                                 :metrics (sampler :summarize)}))
-        (finally
-          (.shutdownNow executor))))))
+        (if duration
+          (long (max 1000 (/ (* (.toMillis (Duration/parse "PT60M"))) 120)))
+          1000)]
+    (fn instrumented-stage [worker]
+      (let [reg (meter-reg)
+            sampler (meter-sampler reg)
+            executor (Executors/newSingleThreadScheduledExecutor)]
+        (.scheduleAtFixedRate
+          executor
+          ^Runnable sampler
+          0
+          (long sample-freq)
+          TimeUnit/MILLISECONDS)
+        (try
+          (let [start-ms (System/currentTimeMillis)]
+            (binding [*stage-reg* reg] (f worker))
+            (.shutdownNow executor)
+            (when-not (.awaitTermination executor 1000 TimeUnit/MILLISECONDS)
+              (throw (ex-info "Could not shut down sampler executor in time" {:stage stage})))
+            (b2/add-report worker {:stage stage,
+                                   :start-ms start-ms
+                                   :end-ms (System/currentTimeMillis)
+                                   :metrics (sampler :summarize)}))
+          (finally
+            (.shutdownNow executor)))))))
 
 (defn wrap-transaction [k f]
   (let [timer-delay
@@ -116,7 +121,7 @@
 (defn wrap-task [task f]
   (let [{:keys [stage, transaction]} task]
     (cond
-      stage (wrap-stage stage f)
+      stage (wrap-stage task f)
       transaction (wrap-transaction transaction f)
       :else f)))
 

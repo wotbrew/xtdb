@@ -392,11 +392,13 @@
 
   ;; easy!
 
+  (def run-duration "PT10M")
+
   (def report1-rocks
     (run-benchmark
       {:node-opts {:index :rocks, :log :rocks, :docs :rocks}
        :benchmark-type :auctionmark
-       :benchmark-opts {:duration "PT30S"}}))
+       :benchmark-opts {:duration run-duration}}))
 
   (require 'xtdb.bench.report)
   (xtdb.bench.report/show-html-report
@@ -408,7 +410,7 @@
     (run-benchmark
       {:node-opts {:index :lmdb, :log :lmdb, :docs :lmdb}
        :benchmark-type :auctionmark
-       :benchmark-opts {:duration "PT30S"}}))
+       :benchmark-opts {:duration run-duration}}))
 
   (xtdb.bench.report/show-html-report
     (xtdb.bench.report/vs
@@ -444,7 +446,7 @@
     ec2
     {:node-opts {:index :rocks, :log :rocks, :docs :rocks}
      :benchmark-type :auctionmark
-     :benchmark-opts {:duration "PT30S"}}
+     :benchmark-opts {:duration run-duration}}
     report-s3-path)
 
   ;; step 5 get your report
