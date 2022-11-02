@@ -48,7 +48,8 @@
 
                                    spec {:mark {:type mark-type, :line true, :tooltip true}
                                          :encoding {:x {:field "time"
-                                                        :type "temporal"
+                                                        :type "quantitative"
+                                                        :timeUnit "utcdayofyearhoursminutessecondsmilliseconds"
                                                         :title "Time"}
                                                     :y (let [y {:field "value"
                                                                 :type "quantitative"
@@ -79,7 +80,7 @@
         group-fn
         (fn [{:keys [meter]}]
           (condp #(str/starts-with? %2 %1) meter
-            "bench." "001 - Benchmark"
+            "bench." "001 - Ben chmark"
             "node." "002 - XTDB Node"
             "jvm.gc" "003 - JVM Memory / GC"
             "jvm.memory" "003 - JVM Memory / GC"
