@@ -209,9 +209,9 @@
 (defn sha-artifacts-exist-in-m2? [sha]
   (.exists (io/file (System/getenv "HOME") ".m2" "repository" "com" "xtdb" "xtdb-core" sha)))
 
-(defn sut-module-deps [{:keys [sha, index, log, docs]}]
+(defn sut-module-deps [{:keys [modules, sha]}]
   (distinct
-    (for [impl [index, log, docs]
+    (for [impl modules
           [nm ver :as dep] (case impl
                              :rocks [['com.xtdb/xtdb-rocksdb]]
                              :lmdb [['com.xtdb/xtdb-lmdb]])]
@@ -294,16 +294,12 @@
 (defn build-jar
   [{:keys [repository
            version
-           index
-           docs
-           log
            sha
-           use-existing-dev-snapshot]
+           use-existing-dev-snapshot
+           modules]
     :or {repository "git@github.com:xtdb/xtdb.git"
          version "master"
-         index :rocks
-         docs :rocks
-         log :rocks}}]
+         modules [:rocks :lmdb]}}]
   (let [sha (or sha (bt/resolve-sha repository version))]
     (assert (nil? sh/*sh-dir*) "must be in xtdb project dir!")
 
@@ -319,9 +315,7 @@
     (let [proj-form (sut-lein-project
                       {:sha sha
                        :version version
-                       :index index
-                       :docs docs
-                       :log log})
+                       :modules [:rocks :lmdb]})
           tmp-dir (xio/create-tmpdir "sut-lein")
           jar-file (io/file tmp-dir "target" "sut-0-SNAPSHOT-standalone.jar")]
       (spit (io/file tmp-dir "project.clj") (pr-str proj-form))
@@ -428,8 +422,7 @@
   ;; ======
 
   ;; step 1 build system-under-test .jar
-  ;; todo just supply modules you want rather than the data-opts
-  (def jar-file (build-jar {:version "1.22.0", :index :rocks, :log :rocks, :docs :rocks}))
+  (def jar-file (build-jar {:version "1.22.0", :modules [:lmdb :rocks]}))
   (def jar-s3-path (format "s3://xtdb-bench/b2/jar/%s.jar" ec2-stack-id))
 
   ;; make jar available to download for ec2 nodes
@@ -463,6 +456,8 @@
   (def report2 (edn/read-string (slurp report-file)))
 
   ;; step 6 visualise your report
+
+  ;; todo tx stats are missing! (not recording?!)
 
   (require 'xtdb.bench.report)
   (xtdb.bench.report/show-html-report
