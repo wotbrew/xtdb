@@ -40,7 +40,8 @@
                  [io.github.azagniotov/dropwizard-metrics-cloudwatch "2.0.3"]
                  [software.amazon.awssdk/cloudwatch]
 
-                 ;; for extra bench measurement
+                 ;; bench 2 (will likely be externalised as a lib)
+                 [com.google.guava/guava "30.1.1-jre"]
                  [io.micrometer/micrometer-core "1.9.5"]
                  [com.github.oshi/oshi-core "6.3.0"]]
 

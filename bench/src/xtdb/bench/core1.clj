@@ -8,7 +8,8 @@
             [xtdb.io :as xio]
             [clojure.java.io :as io]
             [clojure.java.shell :as sh]
-            [clojure.edn :as edn])
+            [clojure.edn :as edn]
+            [clojure.string :as str])
   (:import (io.micrometer.core.instrument MeterRegistry Timer Tag Timer$Sample)
            (java.time Duration)
            (java.util.concurrent.atomic AtomicLong)
@@ -36,6 +37,31 @@
                    (.register meter-reg))]
     {:submit-tx-timer (timer "node.submit-tx")
      :query-timer (timer "node.query")}))
+
+(defmacro reify-protocols-accepting-non-methods
+  "On older versions of XT node methods may be missing."
+  [& reify-def]
+  `(reify ~@(loop [proto nil
+                   forms reify-def
+                   acc []]
+              (if-some [form (first forms)]
+                (cond
+                  (symbol? form)
+                  (if (class? (resolve form))
+                    (recur nil (rest forms) (conj acc form))
+                    (recur form (rest forms) (conj acc form)))
+
+                  (nil? proto)
+                  (recur nil (rest forms) (conj acc form))
+
+                  (list? form)
+                  (if-some [{:keys [arglists]} (get (:sigs @(resolve proto)) (keyword (name (first form))))]
+                    ;; arity-match
+                    (if (some #(= (count %) (count (second form))) arglists)
+                      (recur proto (rest forms) (conj acc form))
+                      (recur proto (rest forms) acc))
+                    (recur proto (rest forms) acc)))
+                acc))))
 
 (defn bench-proxy ^Closeable [node ^MeterRegistry meter-reg]
   (let [last-submitted (atom nil)
@@ -112,7 +138,8 @@
     (fn-gauge "node.kv.keys" #(:xtdb.kv/estimate-num-keys (xt/status node) 0) {:unit "count"})
     (fn-gauge "node.kv.size" #(:xtdb.kv/size (xt/status node) 0) {:unit "bytes"})
 
-    (reify xt/PXtdb
+    (reify-protocols-accepting-non-methods
+      xt/PXtdb
       (status [_] (xt/status node))
       (tx-committed? [_ submitted-tx] (xt/tx-committed? node submitted-tx))
       (sync [_] (xt/sync node))
@@ -122,7 +149,7 @@
       (await-tx-time [_ tx-time timeout] (xt/await-tx-time node tx-time timeout))
       (await-tx [_ tx] (xt/await-tx node tx))
       (await-tx [_ tx timeout] (xt/await-tx node tx timeout))
-      (listen [node event-opts f] (xt/listen node event-opts f))
+      (listen [_ event-opts f] (xt/listen node event-opts f))
       (latest-completed-tx [_] (xt/latest-completed-tx node))
       (latest-submitted-tx [_] (xt/latest-submitted-tx node))
       (attribute-stats [_] (xt/attribute-stats node))
@@ -132,12 +159,19 @@
       xt/PXtdbSubmitClient
       (submit-tx-async [_ tx-ops] (xt/submit-tx-async node tx-ops))
       (submit-tx-async [_ tx-ops opts] (xt/submit-tx-async node tx-ops opts))
-      (submit-tx [this tx-ops] (xt/submit-tx this tx-ops {}))
+
+      ;; record on both branches as older versions of xt do not have the arity-3 version
+      (submit-tx [this tx-ops]
+        (let [ret (.recordCallable ^Timer submit-tx-timer ^Callable (fn [] (xt/submit-tx node tx-ops)))]
+          (reset! last-submitted [ret (System/currentTimeMillis)])
+          (.incrementAndGet submit-counter)
+          ret))
       (submit-tx [_ tx-ops opts]
         (let [ret (.recordCallable ^Timer submit-tx-timer ^Callable (fn [] (xt/submit-tx node tx-ops opts)))]
           (reset! last-submitted [ret (System/currentTimeMillis)])
           (.incrementAndGet submit-counter)
           ret))
+
       (open-tx-log [_ after-tx-id with-ops?] (xt/open-tx-log node after-tx-id with-ops?))
       xt/DBProvider
       (db [_] (xt/db node))
@@ -194,16 +228,15 @@
 (defn install-sha-artifacts-to-m2 [repository sha]
   (let [tmp-dir (xio/create-tmpdir "benchmark-xtdb")]
     (bt/sh-ctx
-      {:dir tmp-dir}
+      {:dir tmp-dir
+       :env {"XTDB_VERSION" sha}}
       (bt/log "Fetching xtdb ref" sha "from" repository)
       (bt/sh "git" "init")
       (bt/sh "git" "remote" "add" "origin" repository)
       (bt/sh "git" "fetch" "origin" "--depth" "1" sha)
       (bt/sh "git" "checkout" sha)
       (bt/log "Installing jars for build")
-      (bt/sh-ctx
-        {:env {"XTDB_VERSION" sha}}
-        (bt/sh "sh" "lein-sub" "install"))
+      (bt/sh "sh" "lein-sub" "install")
       (.delete tmp-dir))))
 
 (defn sha-artifacts-exist-in-m2? [sha]
@@ -222,7 +255,32 @@
     'defproject 'sut "0-SNAPSHOT"
     :dependencies
     (vec
-      (concat [['com.xtdb/xtdb-bench "dev-SNAPSHOT" :exclusions ['com.xtdb]]
+      (concat [['com.xtdb/xtdb-bench
+                "dev-SNAPSHOT"
+                :exclusions '[com.xtdb/xtdb-core
+                              com.xtdb/xtdb-jdbc
+                              com.xtdb/xtdb-kafka
+                              com.xtdb/xtdb-kafka-embedded
+                              com.xtdb/xtdb-rocksdb
+                              com.xtdb/xtdb-lmdb
+                              com.xtdb/xtdb-lucene
+                              com.xtdb/xtdb-metrics
+                              com.xtdb.labs/xtdb-rdf
+                              com.xtdb/xtdb-test
+
+                              pro.juxt.clojars-mirrors.clj-http/clj-http
+                              software.amazon.awssdk/s3
+                              com.amazonaws/aws-java-sdk-ses
+                              com.amazonaws/aws-java-sdk-logs
+
+                              ;; rdf
+                              org.eclipse.rdf4j/rdf4j-repository-sparql
+                              org.eclipse.rdf4j/rdf4j-sail-nativerdf
+                              org.eclipse.rdf4j/rdf4j-repository-sail
+
+                              ;; cloudwatch metrics deps
+                              io.github.azagniotov/dropwizard-metrics-cloudwatch
+                              software.amazon.awssdk/cloudwatch]]
                ['com.xtdb/xtdb-core sha]]
               (sut-module-deps sut)))))
 
@@ -269,12 +327,12 @@
                         :db-dir (xio/create-tmpdir "kv")
                         :db-dir-suffix "kv"})
         undata (fn [t]
-               (case t
-                 nil {}
-                 :rocks
-                 {:kv-store (rocks-kv)}
-                 :lmdb
-                 {:kv-store (lmdb-kv)}))]
+                 (case t
+                   nil {}
+                   :rocks
+                   {:kv-store (rocks-kv)}
+                   :lmdb
+                   {:kv-store (lmdb-kv)}))]
     {:xtdb/tx-log (undata log)
      :xtdb/document-store (undata docs)
      :xtdb/index-store (undata index)}))
@@ -322,15 +380,45 @@
       (bt/sh-ctx {:dir tmp-dir} (bt/sh "lein" "uberjar"))
       jar-file)))
 
-;; use s3 for the jar rather than scp, so you do not have to upload it multiple times (s3 to ec2 is fast, rural broadband less so)
-;; another cool thing is maybe put to path by content hash and diff to avoid upload if needed
-(defn s3-upload-jar [jar-file jar-s3-path]
-  (bt/aws "s3" "cp" (.getAbsolutePath (io/file jar-file)) jar-s3-path))
+(def s3-jar-bucket "xtdb-bench")
+(defn s3-jar-key [jar-hash] (str "b2/jar/" jar-hash ".jar"))
+(defn s3-jar-path [jar-hash] (str "s3://" s3-jar-bucket "/" (s3-jar-key jar-hash)))
+(defn ec2-jar-path [jar-hash] (str "sut-" jar-hash ".jar"))
 
-(defn ec2-setup [ec2 s3-jar-path]
+(defn s3-object-exists? [bucket key]
+  (binding [bt/*sh-ret* :map]
+    (= 0 (:exit (bt/aws "s3api"
+                        "head-object"
+                        "--bucket" bucket
+                        "--key" key)))))
+
+;; use s3 for the jar rather than scp, so you do not have to upload it multiple times (s3 to ec2 is fast, rural broadband less so)
+(defn s3-upload-jar
+  [jar-file]
+  (let [jar-hash (-> (bt/sh "sha256sum" "-b" (.getAbsolutePath jar-file))
+                     (str/split #"\s+")
+                     first)]
+    ;; this is not as useful as you'd think - each uberjar is a .zip with non-deterministic meta, timestamps and such
+    ;; there are tools available for this, but not sure what do for now.
+    #_(s3-object-exists? s3-jar-bucket (s3-jar-key jar-hash))
+    (bt/aws "s3" "cp" (.getAbsolutePath (io/file jar-file)) (s3-jar-path jar-hash))
+    jar-hash))
+
+(defn ec2-file-exists? [ec2 file]
+  (binding [bt/*sh-ret* :map]
+    (= 0 (:exit (ec2/ssh ec2 "test" "-f" (str file))))))
+
+(defrecord JarHandle [ec2 jar-path])
+
+(defn ec2-get-jar [ec2 s3-jar-hash]
+  (ec2/ssh ec2 "aws" "s3" "cp" (s3-jar-path s3-jar-hash) (ec2-jar-path s3-jar-hash)))
+
+(defn ec2-use-jar [ec2 s3-jar-hash]
+  (ec2/ssh ec2 "ln" "-sf" (ec2-jar-path s3-jar-hash) "sut.jar"))
+
+(defn ec2-setup [ec2]
   (ec2/await-ssh ec2)
-  (ec2/install-packages ec2 ["awscli" "java-17-amazon-corretto-headless"])
-  (ec2/ssh ec2 "aws" "s3" "cp" s3-jar-path "sut.jar"))
+  (ec2/install-packages ec2 ["awscli" "java-17-amazon-corretto-headless"]))
 
 (def ^:redef ec2-repls [])
 
@@ -379,20 +467,22 @@
     (spit tmp-file (pr-str report))
     (bt/aws "s3" "cp" (.getAbsolutePath tmp-file) report-s3-path)))
 
-(defn ec2-run-benchmark [ec2 run-benchmark-opts report-s3-path]
+(defn new-s3-report-path []
+  (str "s3://xtdb-bench/b2/report/report-" (System/currentTimeMillis) ".edn"))
+
+(defn ec2-run-benchmark [ec2 {:keys [run-benchmark-opts
+                                     report-s3-path]}]
   (ec2-eval
     ec2
     `((requiring-resolve 'xtdb.bench.core1/ec2-run-benchmark*) ~run-benchmark-opts ~report-s3-path)))
-
 
 (comment
   ;; ======
   ;; Running in process
   ;; ======
 
-  ;; easy!
-
-  (def run-duration "PT30S")
+  (def run-duration "PT2M")
+  (def run-duration "PT10M")
 
   (def report1-rocks
     (run-benchmark
@@ -425,18 +515,23 @@
 
   ;; step 1 build system-under-test .jar
   (def jar-file (build-jar {:version "1.22.0", :modules [:lmdb :rocks]}))
-  (def jar-s3-path (format "s3://xtdb-bench/b2/jar/%s.jar" ec2-stack-id))
 
   ;; make jar available to download for ec2 nodes
-  (s3-upload-jar jar-file jar-s3-path)
+  (def jar-hash (s3-upload-jar jar-file))
+  ;; the path to the jar in s3 is given by its hash string
+  (s3-jar-path jar-hash)
 
   ;; step 2 provision resources
   (def ec2-stack-id (str "bench-" (System/currentTimeMillis)))
-  (def ec2-stack (ec2/provision ec2-stack-id {:instance "m1.small"}))
+  (def ec2-stack (ec2/provision ec2-stack-id {:instance "t3.small"}))
   (def ec2 (ec2/handle ec2-stack))
 
-  ;; step 3 setup ec2 for running core1 benchmarks against sut.jar
-  (ec2-setup ec2 jar-s3-path)
+  ;; step 3 setup ec2 for running core1 benchmarks
+  (ec2-setup ec2)
+  ;; download the jar
+  (ec2-get-jar ec2 jar-hash)
+  ;; activate this hash (you could grab more than one jar and put it on the box)
+  (ec2-use-jar ec2 jar-hash)
 
   ;; step 4 run your benchmark
   (def report-s3-path (format "s3://xtdb-bench/b2/report/%s.edn" ec2-stack-id))
@@ -444,10 +539,11 @@
   ;; todo java opts
   (ec2-run-benchmark
     ec2
-    {:node-opts {:index :rocks, :log :rocks, :docs :rocks}
-     :benchmark-type :auctionmark
-     :benchmark-opts {:duration run-duration}}
-    report-s3-path)
+    {:run-benchmark-opts
+     {:node-opts {:index :rocks, :log :rocks, :docs :rocks}
+      :benchmark-type :auctionmark
+      :benchmark-opts {:duration run-duration}}
+     :report-s3-path report-s3-path})
 
   ;; step 5 get your report
 
@@ -486,6 +582,67 @@
         "In EC2"
         report2)))
 
+
+  ;; here is a bigger script comparing a couple of versions
+
+  ;; run 1-19-0
+  (def report-1-19-0-path (new-s3-report-path))
+
+  ;; build
+  (do
+    (def jar-1-19-0 (s3-upload-jar (build-jar {:version "1.19.0", :modules [:rocks]})))
+    (ec2-get-jar ec2 jar-1-19-0))
+
+  ;; run
+  (do
+    (ec2-use-jar ec2 jar-1-19-0)
+    (ec2-run-benchmark
+      ec2
+      {:run-benchmark-opts
+       {:node-opts {:index :rocks, :log :rocks, :docs :rocks}
+        :benchmark-type :auctionmark
+        :benchmark-opts {:duration run-duration}}
+       :report-s3-path report-1-19-0-path})
+
+    (def report-1-19-0-file (File/createTempFile "report" ".edn"))
+    (bt/aws "s3" "cp" report-1-19-0-path (.getAbsolutePath report-1-19-0-file))
+    (def report-1-19-0 (edn/read-string (slurp report-1-19-0-file)))
+
+    )
+
+  ;; run 1-22-0
+  (def report-1-22-0-path (new-s3-report-path))
+
+  ;; build
+  (do
+    (def jar-1-22-0 (s3-upload-jar (build-jar {:version "1.22.0", :modules [:rocks]})))
+    (ec2-get-jar ec2 jar-1-22-0))
+
+  ;; run
+  (do
+    (ec2-use-jar ec2 jar-1-22-0)
+    (ec2-run-benchmark
+      ec2
+      {:run-benchmark-opts
+       {:node-opts {:index :rocks, :log :rocks, :docs :rocks}
+        :benchmark-type :auctionmark
+        :benchmark-opts {:duration run-duration}}
+       :report-s3-path report-1-22-0-path})
+    (def report-1-22-0-file (File/createTempFile "report" ".edn"))
+    (bt/aws "s3" "cp" report-1-22-0-path (.getAbsolutePath report-1-22-0-file))
+    (def report-1-22-0 (edn/read-string (slurp report-1-22-0-file))))
+
+  ;; report on both
+  (let [filter-report #(xtdb.bench.report/stage-only % :oltp)
+        report1 (filter-report report-1-19-0)
+        report2 (filter-report report-1-22-0)]
+    (xtdb.bench.report/show-html-report
+      (xtdb.bench.report/vs
+        "1.19.0"
+        report1
+        "1.22.0"
+        report2)))
+
   ;; ===
   ;; EC2 misc
   ;; ===
@@ -505,6 +662,9 @@
 
   ;; find stacks starting "bench-"
   (ec2/cfn-stack-ls)
+
+  (doseq [{:strs [StackName]} (ec2/cfn-stack-ls)]
+    (println "run this to delete the stack" (pr-str (list 'ec2/cfn-stack-delete StackName))))
 
   ;; CLEANUP! delete your node when finished with it
   (ec2/cfn-stack-delete ec2-stack-id)

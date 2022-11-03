@@ -79,7 +79,7 @@
         ^Duration duration (:duration task)
         sample-freq
         (if duration
-          (long (max 1000 (/ (* (.toMillis (Duration/parse "PT60M"))) 120)))
+          (long (max 1000 (/ (* (.toMillis duration)) 120)))
           1000)]
     (fn instrumented-stage [worker]
       (let [reg (meter-reg)

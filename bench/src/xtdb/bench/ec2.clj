@@ -227,7 +227,7 @@
 (defn provision
   [id {:keys [ami, instance]
        :or {ami "ami-0ee415e1b8b71305f"
-            instance "m1.small"}}]
+            instance "m6g.medium"}}]
   (let [wait-duration (Duration/ofMinutes 5)
         sleep-duration (Duration/ofSeconds 30)
         stack (atom nil)

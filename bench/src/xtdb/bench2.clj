@@ -114,11 +114,15 @@
         cpu-name (.getName cpu-identifier)
         cpu-core-count (.getPhysicalProcessorCount cpu)
         cpu-max-freq (.getMaxFreq cpu)
-        ram (.getMemory hardware)]
+        ram (.getMemory hardware)
+        kb (* 1024)
+        mb (* kb 1024)
+        gb (* mb 1024)]
     {:jre (System/getProperty "java.vendor.version")
+     :xmx (format "%sMB" (quot (.maxMemory (Runtime/getRuntime)) mb))
      :arch arch
      :os (str/join " " (remove str/blank? [(.getFamily os) os-codename os-version-number]))
-     :memory (format "%sGB" (quot (long (.getTotal ram)) (* 1024 1024 1024)))
+     :memory (format "%sGB" (quot (.getTotal ram) gb))
      :cpu (format "%s, %s cores, %.2fGHZ max" cpu-name cpu-core-count (double (/ cpu-max-freq 1e9)))}))
 
 (defn compile-benchmark [benchmark hook]
@@ -170,6 +174,7 @@
 
                 (fn run-pool [worker]
                   (run! #(start-thread worker %) (range thread-count))
+                  (Thread/sleep (.toMillis duration))
                   (.shutdown executor)
                   (when-not (.awaitTermination executor (.toMillis (.plus duration join-wait)) TimeUnit/MILLISECONDS)
                     (throw (ex-info "Pool threads did not stop within duration+join-wait" {:task task, :executor executor})))))
@@ -190,6 +195,7 @@
                         (.submit executor ^Runnable (fn [] (push-thread-bindings bindings) (f worker)))))]
                 (fn run-concurrently [worker]
                   (dorun (map-indexed #(start-thread worker %1 %2) thread-task-fns))
+                  (Thread/sleep (.toMillis duration))
                   (.shutdown executor)
                   (when-not (.awaitTermination executor (.toMillis (.plus duration join-wait)) TimeUnit/MILLISECONDS)
                     (throw (ex-info "Task threads did not stop within duration+join-wait" {:task task, :executor executor})))))
