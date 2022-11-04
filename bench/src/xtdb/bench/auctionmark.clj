@@ -359,10 +359,12 @@
 
 (defn benchmark [{:keys [seed,
                          threads,
-                         duration]
+                         duration
+                         sync]
                   :or {seed 0,
                        threads 8,
-                       duration "PT30S"}}]
+                       duration "PT30S"
+                       sync false}}]
   (let [duration (Duration/parse duration)]
     {:title "Auction Mark OLTP"
      :seed seed
@@ -391,4 +393,4 @@
                        :duration duration
                        :freq (Duration/ofMillis (* 0.2 (.toMillis duration)))
                        :job-task {:t :call, :transaction :index-item-status-groups, :f index-item-status-groups}}]}
-      {:t :call, :f #(xt/sync (:sut %))}]}))
+      (when sync {:t :call, :f #(xt/sync (:sut %))})]}))

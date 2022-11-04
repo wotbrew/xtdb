@@ -6,7 +6,8 @@
            (com.google.common.collect MinMaxPriorityQueue)
            (java.util.function Function)
            (java.time Instant Duration Clock)
-           (oshi SystemInfo)))
+           (oshi SystemInfo)
+           (java.lang.management ManagementFactory)))
 
 (defrecord Worker [sut random domain-state custom-state clock reports])
 
@@ -117,9 +118,12 @@
         ram (.getMemory hardware)
         kb (* 1024)
         mb (* kb 1024)
-        gb (* mb 1024)]
+        gb (* mb 1024)
+        runtime-mx-bean (ManagementFactory/getRuntimeMXBean)
+        args (.getInputArguments runtime-mx-bean)]
     {:jre (System/getProperty "java.vendor.version")
-     :xmx (format "%sMB" (quot (.maxMemory (Runtime/getRuntime)) mb))
+     :java-opts (str/join " " args)
+     :max-heap (format "%sMB" (quot (.maxMemory (Runtime/getRuntime)) mb))
      :arch arch
      :os (str/join " " (remove str/blank? [(.getFamily os) os-codename os-version-number]))
      :memory (format "%sGB" (quot (.getTotal ram) gb))
@@ -133,6 +137,8 @@
           (hook
             task
             (case t
+              nil (constantly nil)
+
               :do
               (let [{:keys [tasks]} task]
                 (let [fns (mapv compile-task tasks)]
@@ -234,8 +240,22 @@
             start-ms (System/currentTimeMillis)]
         (doseq [f fns]
           (f worker))
+
+        ;; instead of returning a of reports, maybe flatten out so -
+        ;; maybe just return {:stages [], :metrics []}
+
+        #_
+        (let [system (get-system-info)]
+          {:stages (vec (for [rpt @reports]
+                          (-> rpt
+                              (dissoc :metrics)
+                              (assoc :system system))))
+           :metrics (vec (for [{:keys [stage, metrics]} @reports
+                               metric metrics]
+                           (assoc metric :stage stage)))}
+          )
+
         {:system (get-system-info)
-         ;; todo java opts?
          :start-ms start-ms
          :end-ms (System/currentTimeMillis)
          :reports @reports}))))

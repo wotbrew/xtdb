@@ -3,7 +3,8 @@
             [juxt.clojars-mirrors.hiccup.v2v0v0-alpha2.hiccup2.core :as hiccup2]
             [clojure.data.json :as json]
             [clojure.java.io :as io])
-  (:import (java.io File)))
+  (:import (java.io File)
+           (java.time Duration)))
 
 (defn stage-points [metric-data]
   (into (sorted-map)
@@ -93,6 +94,44 @@
 
     metric-groups))
 
+(def transaction-prefix "bench.")
+
+(defn transaction-count [metrics]
+  (->> metrics
+       (filter
+         (every-pred
+           #(= "count" (:statistic %))
+           #(= "count" (:unit %))
+           #(str/starts-with? (:metric %) transaction-prefix)
+           #(str/ends-with? (:metric %) " count")))
+       (map (comp :value last :samples))
+       (reduce +)))
+
+(defn stage-summary [{:keys [stage, start-ms, end-ms]} metrics]
+  (let [duration (Duration/ofMillis (- end-ms start-ms))
+        transactions (transaction-count metrics)]
+    {:stage stage
+     :start-ms start-ms
+     :end-ms end-ms
+     :transactions transactions
+     :throughput (double (/ transactions (.toSeconds duration)))}))
+
+
+
+;; report
+
+;; :system
+;; :stage
+;; :metrics
+
+;; view
+;; takes label [report]
+;; pairs
+
+;; considers time series data across all stages
+;;
+
+
 (defn hiccup-report [title report]
   (let [id-from-thing
         (let [ctr (atom 0)]
@@ -112,13 +151,18 @@
        [:body
         [:h1 title]
 
-        [:div
-         [:table
-          [:thead [:th "config"] [:th "jre"] [:th "xmx"] [:th "arch"] [:th "os"] [:th "cpu"] [:th "memory"]]
-          [:tbody
-           (for [{:keys [label, system]} (:systems report)
-                 :let [{:keys [jre, xmx, arch, os, cpu, memory]} system]]
-             [:tr [:th label] [:td jre] [:td xmx] [:td arch] [:td os] [:td cpu] [:td memory]])]]]
+        (for [{:keys [label, system]} (:systems report)
+              :let [{:keys [jre, max-heap, arch, os, cpu, memory, java-opts]} system]]
+          [:div [:h2 label]
+           [:table
+            [:thead [:th "jre"] [:th "heap"] [:th "arch"] [:th "os"] [:th "cpu"] [:th "memory"]]
+            [:tbody [:tr [:td jre] [:td max-heap] [:td arch] [:td os] [:td cpu] [:td memory]]]]
+           [:pre java-opts]])
+
+        (for [stage (distinct (map :stage (:metrics report)))]
+          [:div
+           [:h3 (name stage)]
+           [:div {:id (name stage)}]])
 
         [:div
          (for [[group metric-data] (sort-by key (group-metrics report))]
@@ -126,10 +170,37 @@
                  (for [meter (sort (set (map :meter metric-data)))]
                    [:div {:id (id-from-thing meter)}])))]
         [:script
-         (->> (for [[meter metric-data] (group-by :meter (:metrics report))]
-                (format "vegaEmbed('#%s', %s);" (id-from-thing meter)
-                        (json/write-str
-                          {:hconcat (vega-plots metric-data)})))
+         (->> (concat
+                (for [[stage metric-data] (group-by :stage (:metrics report))
+                      :let [data {:values (vec (for [[vs-label metric-data] (group-by :vs-label metric-data)
+                                                     [transaction metric-data] (group-by :meter metric-data)
+                                                     :when (str/starts-with? transaction transaction-prefix)
+                                                     :let [transaction (subs transaction (count transaction-prefix))
+                                                           transactions (transaction-count metric-data)]
+                                                     :when (pos? transactions)]
+                                                 {:config vs-label
+                                                  :transaction transaction
+                                                  :transactions transactions}))}
+                            vega
+                            {:data data
+                             :hconcat [{:mark "bar"
+                                        :encoding {:x {:field "config", :type "nominal", :sort "-y"}
+                                                   :y {:field "transactions", :aggregate "sum", :type "quantitative"}}}
+                                       {:mark "bar"
+                                        :encoding {:x {:field "transaction", :type "nominal", :sort "-y"}
+                                                   :y {:field "transactions", :type "quantitative"}
+                                                   :xOffset {:field "config", :type "nominal"}
+                                                   :color {:field "config", :type "nominal"}}}]}]
+                      :when (->> data :values (map :transactions) (some pos?))]
+                  (format "vegaEmbed('#%s', %s);" (name stage) (json/write-str vega)))
+
+                (for [[meter metric-data] (group-by :meter (:metrics report))]
+                  (format "vegaEmbed('#%s', %s);" (id-from-thing meter)
+                          (json/write-str
+                            {:hconcat (vega-plots metric-data)}))))
+
+
+
               (str/join "\n")
               hiccup2/raw)]]])))
 

@@ -108,7 +108,7 @@
   (let [timer-delay
         (delay
           (when *stage-reg*
-            (-> (Timer/builder (str "bench." (name k)))
+            (-> (Timer/builder (str "bench.transaction." (name k)))
                 (.publishPercentiles (double-array percentiles))
                 (.maximumExpectedValue (Duration/ofHours 8))
                 (.minimumExpectedValue (Duration/ofNanos 1))

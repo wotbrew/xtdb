@@ -562,8 +562,6 @@
 
   ;; step 6 visualise your report
 
-  ;; todo tx stats are missing! (not recording?!)
-
   (require 'xtdb.bench.report)
   (xtdb.bench.report/show-html-report
     (xtdb.bench.report/vs
