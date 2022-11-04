@@ -390,4 +390,5 @@
                       {:t :freq-job
                        :duration duration
                        :freq (Duration/ofMillis (* 0.2 (.toMillis duration)))
-                       :job-task {:t :call, :transaction :index-item-status-groups, :f index-item-status-groups}}]}]}))
+                       :job-task {:t :call, :transaction :index-item-status-groups, :f index-item-status-groups}}]}
+      {:t :call, :f #(xt/sync (:sut %))}]}))

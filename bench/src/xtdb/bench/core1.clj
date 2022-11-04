@@ -458,8 +458,11 @@
       (alter-var-root #'ec2-repls conj ret)
       ret)))
 
-(defn ec2-eval [ec2 & code]
-  (ec2/ssh ec2 "java" "-jar" "sut.jar" "-e" (pr-str (pr-str (list* 'do code)))))
+(defn ec2-eval
+  ([ec2 code] (ec2-eval ec2 code {}))
+  ([ec2 code {:keys [env, java-opts]}]
+   ;; todo :env
+   (apply ec2/ssh ec2 (concat ["java"] java-opts ["-jar" "sut.jar" "-e" (pr-str (pr-str code))]))))
 
 (defn ec2-run-benchmark* [run-benchmark-opts report-s3-path]
   (let [report (run-benchmark run-benchmark-opts)
@@ -470,11 +473,15 @@
 (defn new-s3-report-path []
   (str "s3://xtdb-bench/b2/report/report-" (System/currentTimeMillis) ".edn"))
 
-(defn ec2-run-benchmark [ec2 {:keys [run-benchmark-opts
+(defn ec2-run-benchmark [ec2 {:keys [env
+                                     java-opts
+                                     run-benchmark-opts
                                      report-s3-path]}]
   (ec2-eval
     ec2
-    `((requiring-resolve 'xtdb.bench.core1/ec2-run-benchmark*) ~run-benchmark-opts ~report-s3-path)))
+    `((requiring-resolve 'xtdb.bench.core1/ec2-run-benchmark*) ~run-benchmark-opts ~report-s3-path)
+    {:env env
+     :java-opts java-opts}))
 
 (comment
   ;; ======
@@ -585,28 +592,30 @@
 
   ;; here is a bigger script comparing a couple of versions
 
-  ;; run 1-19-0
-  (def report-1-19-0-path (new-s3-report-path))
+  ;; run 1-21-0
+  (def report-1-21-0-path (new-s3-report-path))
 
   ;; build
   (do
-    (def jar-1-19-0 (s3-upload-jar (build-jar {:version "1.19.0", :modules [:rocks]})))
-    (ec2-get-jar ec2 jar-1-19-0))
+    (def jar-1-21-0 (s3-upload-jar (build-jar {:version "1.21.0", :modules [:rocks]})))
+    (ec2-get-jar ec2 jar-1-21-0))
 
   ;; run
   (do
-    (ec2-use-jar ec2 jar-1-19-0)
+    (ec2-use-jar ec2 jar-1-21-0)
     (ec2-run-benchmark
       ec2
-      {:run-benchmark-opts
+      {:env {"MALLOC_ARENA_MAX" 2}
+       :java-opts ["--add-opens java.base/java.util.concurrent=ALL-UNNAMED"]
+       :run-benchmark-opts
        {:node-opts {:index :rocks, :log :rocks, :docs :rocks}
         :benchmark-type :auctionmark
         :benchmark-opts {:duration run-duration}}
-       :report-s3-path report-1-19-0-path})
+       :report-s3-path report-1-21-0-path})
 
-    (def report-1-19-0-file (File/createTempFile "report" ".edn"))
-    (bt/aws "s3" "cp" report-1-19-0-path (.getAbsolutePath report-1-19-0-file))
-    (def report-1-19-0 (edn/read-string (slurp report-1-19-0-file)))
+    (def report-1-21-0-file (File/createTempFile "report" ".edn"))
+    (bt/aws "s3" "cp" report-1-21-0-path (.getAbsolutePath report-1-21-0-file))
+    (def report-1-21-0 (edn/read-string (slurp report-1-21-0-file)))
 
     )
 
@@ -634,11 +643,11 @@
 
   ;; report on both
   (let [filter-report #(xtdb.bench.report/stage-only % :oltp)
-        report1 (filter-report report-1-19-0)
+        report1 (filter-report report-1-21-0)
         report2 (filter-report report-1-22-0)]
     (xtdb.bench.report/show-html-report
       (xtdb.bench.report/vs
-        "1.19.0"
+        "1.21.0"
         report1
         "1.22.0"
         report2)))
