@@ -1,0 +1,24 @@
+(ns xtdb.bench2.tpch
+  (:require [xtdb.fixtures.tpch :as tpch]
+            [xtdb.api :as xt]))
+
+(defn benchmark [{:keys [scale-factor,
+                         seed]
+                  :or {scale-factor 0.05
+                       seed 0}}]
+  (let [q (fn [qsym]
+            (let [qvar (ns-resolve 'xtdb.fixtures.tpch qsym)]
+              {:t :call
+               :stage (keyword (name qsym))
+               :f (fn [{:keys [sut]}]
+                    (try (count (xt/q (xt/db sut) @qvar))
+                         (catch Throwable e
+                           ;; deal with error?
+                           )))}))]
+    {:title "TPC-H"
+     :seed seed
+     :tasks (into [{:t :call,
+                    :stage :load,
+                    :f (fn [{:keys [sut]}] (tpch/load-docs! sut scale-factor))}]
+                  (map q)
+                  '[q1 q2 q3 q4 q5 q6 q7 q8 q9 q10 q11 q12 q13 q14 q15 q16 q17 q18 q19 q20 q21 q22])}))

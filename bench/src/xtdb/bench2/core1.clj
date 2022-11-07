@@ -289,7 +289,9 @@
   (let [benchmark
         (case benchmark-type
           :auctionmark
-          ((requiring-resolve 'xtdb.bench2.auctionmark/benchmark) benchmark-opts))
+          ((requiring-resolve 'xtdb.bench2.auctionmark/benchmark) benchmark-opts)
+          :tpch
+          ((requiring-resolve 'xtdb.bench2.tpch/benchmark) benchmark-opts))
         benchmark-fn (b2/compile-benchmark benchmark wrap-task)]
     (with-open [node (xt/start-node (undata-node-opts node-opts))]
       (benchmark-fn node))))
@@ -464,35 +466,19 @@
   ;; ======
   ;; TPC-H (temporary while I think)
   ;; ======
-  (require 'xtdb.fixtures.tpch)
   (def sf 0.05)
 
-  (defn tpch [sf]
-    (let [q (fn [qsym]
-              (let [qvar (ns-resolve 'xtdb.fixtures.tpch qsym)]
-                {:t :call
-                 :stage (keyword (name qsym))
-                 :f (fn [{:keys [sut]}]
-                      (try (count (xt/q (xt/db sut) @qvar))
-                           (catch Throwable e
-                             ;; deal with error?
-                             )))}))]
-      {:seed 0
-       :tasks (into [{:t :call,
-                      :stage :load,
-                      :f (fn [{:keys [sut]}] (xtdb.fixtures.tpch/load-docs! sut sf))}]
-                    (map q)
-                    '[q1 q2 q3 q4 q5 q6 q7 q8 q9 q10 q11 q12 q13 q14 q15 q16 q17 q18 q19 q20 q21 q22])}))
-
   (def report-tpch-rocks
-    (with-open [node (xt/start-node (undata-node-opts {:index :rocks, :log :rocks, :docs :rocks}))]
-      (let [f (b2/compile-benchmark (tpch sf) wrap-task)]
-        (f node))))
+    (run-benchmark
+      {:node-opts {:index :rocks, :log :rocks, :docs :rocks}
+       :benchmark-type :tpch
+       :benchmark-opts {:scale-factor sf}}))
 
   (def report-tpch-lmdb
-    (with-open [node (xt/start-node (undata-node-opts {:index :lmdb, :log :lmdb, :docs :lmdb}))]
-      (let [f (b2/compile-benchmark (tpch sf) wrap-task)]
-        (f node))))
+    (run-benchmark
+      {:node-opts {:index :lmdb, :log :lmdb, :docs :lmdb}
+       :benchmark-type :tpch
+       :benchmark-opts {:scale-factor sf}}))
 
   (xtdb.bench2.report/show-html-report
     (xtdb.bench2.report/vs
