@@ -5,13 +5,6 @@
             [clojure.java.io :as io])
   (:import (java.io File)))
 
-(defn stage-points [metric-data]
-  (into (sorted-map)
-        (for [[stage metric-data] (group-by :stage metric-data)
-              :let [first-samples (keep (comp first :samples) metric-data)
-                    earliest-sample (reduce min Long/MAX_VALUE (map :time-ms first-samples))]]
-          [stage earliest-sample])))
-
 ;; use vega to plot metrics for now
 ;; works at repl, no servers needed
 ;; if this approach takes of the time series data wants to be graphed in something like a shared prometheus / grafana during run
@@ -214,15 +207,12 @@
 
 (defn- normalize-time [report]
   (let [{:keys [start-ms, stages, metrics]} report
-        min-time start-ms #_(->> metrics
-                                 (mapcat :samples)
-                                 (reduce #(min %1 (:time-ms %2)) Long/MAX_VALUE))
         new-metrics (for [metric metrics
                           :let [{:keys [samples]} metric
-                                new-samples (mapv #(update % :time-ms - min-time) samples)]]
+                                new-samples (mapv #(update % :time-ms - start-ms) samples)]]
                       (assoc metric :samples new-samples))]
     (assoc report
-      :stages (mapv #(-> % (update :start-ms - min-time) (update :end-ms - min-time)) stages)
+      :stages (mapv #(-> % (update :start-ms - start-ms) (update :end-ms - start-ms)) stages)
       :metrics (vec new-metrics))))
 
 (defn vs [label report & more]
