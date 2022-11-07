@@ -1,4 +1,4 @@
-(ns xtdb.bench.measurement
+(ns xtdb.bench2.measurement
   (:require [clojure.string :as str]
             [xtdb.bench2 :as b2])
   (:import (java.time Duration)

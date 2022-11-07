@@ -1,10 +1,10 @@
-(ns xtdb.bench.core1
+(ns xtdb.bench2.core1
   (:require [xtdb.api :as xt]
-            [xtdb.bench.measurement :as bm]
+            [xtdb.bench2.measurement :as bm]
             [xtdb.bus :as bus]
             [xtdb.bench2 :as b2]
-            [xtdb.bench.tools :as bt]
-            [xtdb.bench.ec2 :as ec2]
+            [xtdb.bench2.tools :as bt]
+            [xtdb.bench2.ec2 :as ec2]
             [xtdb.io :as xio]
             [clojure.java.io :as io]
             [clojure.java.shell :as sh]
@@ -344,7 +344,7 @@
   (let [benchmark
         (case benchmark-type
           :auctionmark
-          ((requiring-resolve 'xtdb.bench.auctionmark/benchmark) benchmark-opts))
+          ((requiring-resolve 'xtdb.bench2.auctionmark/benchmark) benchmark-opts))
         benchmark-fn (b2/compile-benchmark benchmark wrap-task)]
     (with-open [node (xt/start-node (undata-node-opts node-opts))]
       (benchmark-fn node))))
@@ -479,7 +479,7 @@
                                      report-s3-path]}]
   (ec2-eval
     ec2
-    `((requiring-resolve 'xtdb.bench.core1/ec2-run-benchmark*) ~run-benchmark-opts ~report-s3-path)
+    `((requiring-resolve 'xtdb.bench2.core1/ec2-run-benchmark*) ~run-benchmark-opts ~report-s3-path)
     {:env env
      :java-opts java-opts}))
 
@@ -497,9 +497,9 @@
        :benchmark-type :auctionmark
        :benchmark-opts {:duration run-duration}}))
 
-  (require 'xtdb.bench.report)
-  (xtdb.bench.report/show-html-report
-    (xtdb.bench.report/vs
+  (require 'xtdb.bench2.report)
+  (xtdb.bench2.report/show-html-report
+    (xtdb.bench2.report/vs
       "Rocks"
       report1-rocks))
 
@@ -509,8 +509,8 @@
        :benchmark-type :auctionmark
        :benchmark-opts {:duration run-duration}}))
 
-  (xtdb.bench.report/show-html-report
-    (xtdb.bench.report/vs
+  (xtdb.bench2.report/show-html-report
+    (xtdb.bench2.report/vs
       "Rocks"
       report1-rocks
       "LMDB"
@@ -549,8 +549,8 @@
       (let [f (b2/compile-benchmark (tpch sf) wrap-task)]
         (f node))))
 
-  (xtdb.bench.report/show-html-report
-    (xtdb.bench.report/vs
+  (xtdb.bench2.report/show-html-report
+    (xtdb.bench2.report/vs
       "Rocks"
       report-tpch-rocks
       "LMDB"
@@ -602,26 +602,26 @@
 
   ;; step 6 visualise your report
 
-  (require 'xtdb.bench.report)
-  (xtdb.bench.report/show-html-report
-    (xtdb.bench.report/vs
+  (require 'xtdb.bench2.report)
+  (xtdb.bench2.report/show-html-report
+    (xtdb.bench2.report/vs
       "Report2"
       report2))
 
   ;; compare to the earlier in-process report (now imagine running on n nodes with different configs)
-  (xtdb.bench.report/show-html-report
-    (xtdb.bench.report/vs
+  (xtdb.bench2.report/show-html-report
+    (xtdb.bench2.report/vs
       "On laptop"
       report1-rocks
       "In EC2"
       report2))
 
   ;; filter reports to just :oltp stage
-  (let [filter-report #(xtdb.bench.report/stage-only % :oltp)
+  (let [filter-report #(xtdb.bench2.report/stage-only % :oltp)
         report1 (filter-report report1-rocks)
         report2 (filter-report report2)]
-    (xtdb.bench.report/show-html-report
-      (xtdb.bench.report/vs
+    (xtdb.bench2.report/show-html-report
+      (xtdb.bench2.report/vs
         "On laptop"
         report1
         "In EC2"
@@ -680,11 +680,11 @@
     (def report-1-22-0 (edn/read-string (slurp report-1-22-0-file))))
 
   ;; report on both
-  (let [filter-report #(xtdb.bench.report/stage-only % :oltp)
+  (let [filter-report #(xtdb.bench2.report/stage-only % :oltp)
         report1 (filter-report report-1-21-0)
         report2 (filter-report report-1-22-0)]
-    (xtdb.bench.report/show-html-report
-      (xtdb.bench.report/vs
+    (xtdb.bench2.report/show-html-report
+      (xtdb.bench2.report/vs
         "1.21.0"
         report1
         "1.22.0"

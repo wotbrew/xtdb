@@ -1,6 +1,6 @@
-(ns xtdb.bench.ec2
+(ns xtdb.bench2.ec2
   (:require [clojure.data.json :as json]
-            [xtdb.bench.tools :as bt]
+            [xtdb.bench2.tools :as bt]
             [clojure.java.io :as io]
             [clojure.string :as str])
   (:import (java.time LocalDateTime Instant ZoneId Duration)

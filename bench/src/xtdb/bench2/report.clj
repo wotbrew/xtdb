@@ -1,4 +1,4 @@
-(ns xtdb.bench.report
+(ns xtdb.bench2.report
   (:require [clojure.string :as str]
             [juxt.clojars-mirrors.hiccup.v2v0v0-alpha2.hiccup2.core :as hiccup2]
             [clojure.data.json :as json]

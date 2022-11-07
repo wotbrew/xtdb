@@ -1,4 +1,4 @@
-(ns xtdb.bench.tools
+(ns xtdb.bench2.tools
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.java.shell :as sh]
@@ -23,12 +23,12 @@
       {:t :file,
        ;; todo tmp-dir prop
        :file (.getAbsolutePath (io/file "/tmp" (bench-path epoch-ms filename)))})
-    :ec2 ((requiring-resolve 'xtdb.bench.ec2/loc-fn) env epoch-ms)))
+    :ec2 ((requiring-resolve 'xtdb.bench2.ec2/loc-fn) env epoch-ms)))
 
 (defn resolve-env [env sut]
   (case (:t env)
     :local env
-    :ec2 ((requiring-resolve 'xtdb.bench.ec2/resolve-env) env sut)))
+    :ec2 ((requiring-resolve 'xtdb.bench2.ec2/resolve-env) env sut)))
 
 (defn log [& args] (apply println args))
 
@@ -95,7 +95,7 @@
 
 (defn resolve-sut [sut loc-fn]
   (case (:t sut)
-    :xtdb ((requiring-resolve 'xtdb.bench.core1/resolve-sut) sut loc-fn)))
+    :xtdb ((requiring-resolve 'xtdb.bench2.core1/resolve-sut) sut loc-fn)))
 
 (defn resolve-req
   [req]
@@ -143,10 +143,10 @@
 
 (defn run-resolved! [resolved-req]
   (let [{:keys [report, sut, t, args]} resolved-req
-        benchmark (case t :auctionmark ((requiring-resolve 'xtdb.bench.auctionmark/benchmark) args))
+        benchmark (case t :auctionmark ((requiring-resolve 'xtdb.bench2.auctionmark/benchmark) args))
         {:keys [start, hook]}
         (case (:t sut)
-          :xtdb ((requiring-resolve 'xtdb.bench.core1/prep) resolved-req))
+          :xtdb ((requiring-resolve 'xtdb.bench2.core1/prep) resolved-req))
         run-benchmark (b2/compile-benchmark benchmark hook)]
     (with-open [^Closeable sut (start)]
       (let [out (run-benchmark sut)
@@ -165,8 +165,8 @@
     (copy {:t :file, :file manifest-file} manifest)
 
     (case (:t sut)
-      :xtdb ((requiring-resolve 'xtdb.bench.core1/provide-sut-requirements) sut))
+      :xtdb ((requiring-resolve 'xtdb.bench2.core1/provide-sut-requirements) sut))
 
     {:resolved-req resolved
      :handle (case (:t env)
-               :ec2 ((requiring-resolve 'xtdb.bench.ec2/setup!) resolved))}))
+               :ec2 ((requiring-resolve 'xtdb.bench2.ec2/setup!) resolved))}))

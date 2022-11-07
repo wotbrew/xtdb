@@ -1,7 +1,7 @@
-(ns xtdb.bench.auctionmark
+(ns xtdb.bench2.auctionmark
   (:require [xtdb.bench2 :as b2]
             [xtdb.api :as xt]
-            [xtdb.bench.core1 :as bcore1]
+            [xtdb.bench2.core1 :as bcore1]
             [clojure.string :as str]
             [clojure.java.io :as io])
   (:import (java.time Instant Duration)

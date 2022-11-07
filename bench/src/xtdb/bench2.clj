@@ -289,5 +289,5 @@
                :stage :foo
                :f (fn [_worker] (Thread/sleep 100))}]}
      ;; can use measurement to wrap stages/transactions with metrics
-     @(requiring-resolve `xtdb.bench.measurement/wrap-task))
+     @(requiring-resolve `xtdb.bench2.measurement/wrap-task))
    42))
