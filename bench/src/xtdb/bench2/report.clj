@@ -3,8 +3,7 @@
             [juxt.clojars-mirrors.hiccup.v2v0v0-alpha2.hiccup2.core :as hiccup2]
             [clojure.data.json :as json]
             [clojure.java.io :as io])
-  (:import (java.io File)
-           (java.time Duration)))
+  (:import (java.io File)))
 
 (defn stage-points [metric-data]
   (into (sorted-map)
@@ -65,14 +64,15 @@
                                                     {:field "config",
                                                      :legend {:labelLimit 280}
                                                      :type "nominal"})}}]]
-                       {:layer [(if facet-vs
+                       {:width 432
+                        :layer [(if facet-vs
                                   {:data data
                                    :facet {:column {:field "config"}
                                            :header {:title nil}}
                                    :spec spec}
                                   (assoc spec :data data))
 
-                                #_{:data {:values (vec (for [{:keys [stage, start-ms, end-ms, vs-label]} stages]
+                                {:data {:values (vec (for [{:keys [stage, start-ms, end-ms, vs-label]} stages]
                                                        {:stage stage
                                                         :start (str start-ms)
                                                         :end end-ms
@@ -121,20 +121,6 @@
        (map (comp :value last :samples))
        (reduce +)))
 
-;; report
-
-;; :system
-;; :stage
-;; :metrics
-
-;; view
-;; takes label [report]
-;; pairs
-
-;; considers time series data across all stages
-;;
-
-
 (defn hiccup-report [title report]
   (let [id-from-thing
         (let [ctr (atom 0)]
@@ -156,7 +142,7 @@
        [:body
         [:h1 title]
 
-        (for [{:keys [label, system]} (:systems report)
+        (for [{:keys [label, system]} systems
               :let [{:keys [jre, max-heap, arch, os, cpu, memory, java-opts]} system]]
           [:div [:h2 label]
            [:table
@@ -167,9 +153,7 @@
         [:div {:id "stage-summary"}]
 
         (for [stage (distinct (map :stage (:metrics report)))]
-          [:div
-           [:h3 (name stage)]
-           [:div {:id (name stage)}]])
+          [:div {:id (name stage)}])
 
         [:div
          (for [[group metric-data] (sort-by key (group-metrics report))]
@@ -200,7 +184,8 @@
                                                   :transaction transaction
                                                   :transactions transactions}))}
                             vega
-                            {:data data
+                            {:title (name stage)
+                             :data data
                              :hconcat [{:mark "bar"
                                         :encoding {:x {:field "config", :type "nominal", :sort "-y"}
                                                    :y {:field "transactions", :aggregate "sum", :type "quantitative"}}}
@@ -230,8 +215,8 @@
 (defn- normalize-time [report]
   (let [{:keys [start-ms, stages, metrics]} report
         min-time start-ms #_(->> metrics
-                      (mapcat :samples)
-                      (reduce #(min %1 (:time-ms %2)) Long/MAX_VALUE))
+                                 (mapcat :samples)
+                                 (reduce #(min %1 (:time-ms %2)) Long/MAX_VALUE))
         new-metrics (for [metric metrics
                           :let [{:keys [samples]} metric
                                 new-samples (mapv #(update % :time-ms - min-time) samples)]]
