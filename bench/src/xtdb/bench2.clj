@@ -241,24 +241,21 @@
         (doseq [f fns]
           (f worker))
 
-        ;; instead of returning a of reports, maybe flatten out so -
-        ;; maybe just return {:stages [], :metrics []}
-
-        #_
         (let [system (get-system-info)]
           {:stages (vec (for [rpt @reports]
-                          (-> rpt
-                              (dissoc :metrics)
-                              (assoc :system system))))
+                          (dissoc rpt :metrics)))
            :metrics (vec (for [{:keys [stage, metrics]} @reports
                                metric metrics]
-                           (assoc metric :stage stage)))}
-          )
+                           (assoc metric :stage stage)))
+           :system system
+           :start-ms start-ms
+           :end-ms (System/currentTimeMillis)
 
-        {:system (get-system-info)
-         :start-ms start-ms
-         :end-ms (System/currentTimeMillis)
-         :reports @reports}))))
+           ;; todo remove below (flat stages/metrics better)
+           :reports @reports
+
+           }
+          )))))
 
 (defn add-report [worker report]
   (swap! (:reports worker) conj report))
