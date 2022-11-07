@@ -38,28 +38,6 @@
 (defn cfn-stack-delete [stack-name]
   (bt/aws "cloudformation" "delete-stack" "--stack-name" stack-name))
 
-(defn loc-fn [_env epoch-ms]
-  (fn [filename]
-    {:t :s3,
-     :bucket "xtdb-bench"
-     :key (bt/bench-path epoch-ms filename)}))
-
-(defn resolve-env [env sut]
-  (let [{:keys [instance,
-                ami]
-         :or {instance "m1.small"
-              ami "ami-0ee415e1b8b71305f"}} env
-        {:keys [jre]} sut
-
-        jre-package
-        (case [(:t jre) (:version jre)]
-          [:corretto 17] "java-17-amazon-corretto-headless")]
-    (merge
-      env
-      {:instance instance
-       :ami ami
-       :packages [jre-package "awscli"]})))
-
 (defn cfn-stack-describe [id]
   (-> (bt/aws "cloudformation" "describe-stacks" "--stack-name" id)
       (get "Stacks")
@@ -105,33 +83,6 @@
                                              (ZoneId/of "Europe/London"))
                     (.format (DateTimeFormatter/ofPattern "YYYY-MM-dd-HH-mm-ss-SS")))))
 
-(defn provision! ^Ec2Handle [resolved-req]
-  (let [id (aws-id (:epoch-ms resolved-req))
-        wait-duration (Duration/ofMinutes 5)
-        sleep-duration (Duration/ofSeconds 30)
-        stack (atom nil)
-        poll-stack #(reset! stack (cfn-stack-describe id))]
-
-    (cfn-stack-create (:env resolved-req) id)
-
-    (bt/log "Waiting for stack, this may take a while")
-    (bt/log "  id:" id)
-
-    (loop [wait-until (+ (System/currentTimeMillis) (.toMillis wait-duration))]
-      (Thread/sleep (.toMillis sleep-duration))
-      (poll-stack)
-      (when-not (= "CREATE_COMPLETE" (get @stack "StackStatus"))
-        (when (< (System/currentTimeMillis) wait-until)
-          (recur wait-until))))
-
-    (when-not (= "CREATE_COMPLETE" (get @stack "StackStatus"))
-      (throw (ex-info "Timed out waiting for stack" {:stack-timeout true :stack-name id})))
-
-    (bt/log "Stack created")
-    (bt/log "  id:" id)
-
-    (map->Ec2Handle (merge {:id id :stack @stack} (ssh-remote @stack)))))
-
 (defn await-ssh [ec2]
   (let [ssh-wait-duration (Duration/ofMinutes 2)
         ssh-wait-until (+ (System/currentTimeMillis) (.toMillis ssh-wait-duration))]
@@ -151,26 +102,6 @@
 (defn install-packages [ec2 packages]
   (when (seq packages)
     (apply ssh ec2 "sudo" "yum" "install" "-y" packages)))
-
-(defn setup!
-  ([resolved-req] (setup! resolved-req (provision! resolved-req)))
-  ([resolved-req ec2]
-   (let [{:keys [manifest, sut, env]} resolved-req
-         {:keys [jar]} sut]
-
-     (await-ssh ec2)
-
-     (when-some [packages (seq (:packages env))]
-       (bt/log "Installing packages, this may take a while")
-       (apply ssh ec2 "sudo" "yum" "install" "-y" packages))
-
-     (bt/log "Downloading sut.jar")
-     (ssh ec2 "aws" "s3" "cp" (bt/s3-cli-path jar) "sut.jar")
-
-     (bt/log "Downloading manifest.edn")
-     (ssh ec2 "aws" "s3" "cp" (bt/s3-cli-path manifest) "manifest.edn")
-
-     ec2)))
 
 (defn clj [ec2 & code]
   (ssh ec2

@@ -200,31 +200,6 @@
     (with-open [node (xt/start-node node-opts)]
       (f node))))
 
-(defn resolve-sut [sut loc-fn]
-  (let [{:keys [repository
-                version
-                index
-                docs
-                log
-                jre]
-         :or {repository "git@github.com:xtdb/xtdb.git"
-              version "master"
-              index :rocks
-              docs :rocks
-              log :rocks
-              jre {:t :corretto, :version 17}}} sut
-        sha (bt/resolve-sha repository version)]
-    (merge
-      sut
-      {:repository repository
-       :version version
-       :index index
-       :docs docs
-       :log log
-       :sha sha
-       :jre jre
-       :jar (loc-fn "sut.jar")})))
-
 (defn install-sha-artifacts-to-m2 [repository sha]
   (let [tmp-dir (xio/create-tmpdir "benchmark-xtdb")]
     (bt/sh-ctx
@@ -288,36 +263,6 @@
   (bt/sh-ctx
     {:dir "bench"}
     (bt/sh "lein" "install")))
-
-(defn build-sut-jar [sut]
-  (let [{:keys [repository, sha, use-existing-dev-snapshot]} sut]
-    (assert (nil? sh/*sh-dir*) "must be in xtdb project dir!")
-
-    (when-not use-existing-dev-snapshot
-      (bt/log "Installing current bench sources to ~/.m2")
-      (install-self-to-m2))
-
-    (when-not (sha-artifacts-exist-in-m2? sha)
-      (bt/log "Installing target sha to ~/.m2")
-      (install-sha-artifacts-to-m2 repository sha))
-
-    (bt/log "Building sut.jar")
-    (let [proj-form (sut-lein-project sut)
-          tmp-dir (xio/create-tmpdir "sut-lein")
-          jar-file (io/file tmp-dir "target" "sut-0-SNAPSHOT-standalone.jar")]
-      (spit (io/file tmp-dir "project.clj") (pr-str proj-form))
-      (bt/sh-ctx {:dir tmp-dir} (bt/sh "lein" "uberjar"))
-      jar-file)))
-
-(defn provide-sut-requirements [sut]
-  (let [{:keys [jar]} sut
-        jar-local (build-sut-jar sut)]
-    (bt/copy {:t :file, :file jar-local} jar)))
-
-(defn prep [{:keys [sut]}]
-  #_(let [node-opts (sut-node-opts sut)]
-      {:start #(xt/start-node node-opts)
-       :hook wrap-task}))
 
 (defn undata-node-opts [{:keys [index, log, docs]}]
   (let [rocks-kv (fn [] {:xtdb/module 'xtdb.rocksdb/->kv-store,
