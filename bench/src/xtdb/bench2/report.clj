@@ -56,31 +56,32 @@
                                                     stack-vs
                                                     {:field "config",
                                                      :legend {:labelLimit 280}
-                                                     :type "nominal"})}}]]
-                       {:width 432
-                        :layer [(if facet-vs
-                                  {:data data
-                                   :facet {:column {:field "config"}
-                                           :header {:title nil}}
-                                   :spec spec}
-                                  (assoc spec :data data))
+                                                     :type "nominal"})}}
 
-                                {:data {:values (vec (for [{:keys [stage, start-ms, end-ms, vs-label]} stages]
-                                                       {:stage stage
-                                                        :start (str start-ms)
-                                                        :end end-ms
-                                                        :config vs-label}))
-                                        :format {:parse {:start "utc:'%Q'"}}}
-                                 :mark "point"
-                                 :encoding {:x {:field "start"
-                                                :type "quantitative"
-                                                :timeUnit "utcdayofyearhoursminutessecondsmilliseconds"}
-                                            :tooltip {:field "stage"}
-                                            :color {:field "config",
-                                                    :legend {:labelLimit 280}
-                                                    :type "nominal"}}}
 
-                                ]}))})))
+                                 stage-layer
+                                 {:data {:values (vec (for [{:keys [stage, start-ms, end-ms, vs-label]} stages]
+                                                        {:stage stage
+                                                         :start (str start-ms)
+                                                         :end end-ms
+                                                         :config vs-label}))
+                                         :format {:parse {:start "utc:'%Q'"}}}
+                                  :mark "point"
+                                  :encoding {:x {:field "start"
+                                                 :type "quantitative"
+                                                 :timeUnit "utcdayofyearhoursminutessecondsmilliseconds"}
+                                             :tooltip {:field "stage"}
+                                             :color {:field "config",
+                                                     :legend {:labelLimit 280}
+                                                     :type "nominal"}}}]]
+                       (if facet-vs
+                         {:width 432
+                          :data data
+                          :facet {:column {:field "config"} :header {:title nil}}
+                          ;; todo can I still layer the stage points?
+                          :spec spec}
+                         {:width 432
+                          :layer [(assoc spec :data data) stage-layer]})))})))
 
 (defn group-metrics [rs]
   (let [{:keys [metrics]} rs
