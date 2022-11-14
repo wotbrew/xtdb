@@ -242,20 +242,16 @@
           (f worker))
 
         (let [system (get-system-info)]
-          {:stages (vec (for [rpt @reports]
-                          (dissoc rpt :metrics)))
+          {:stages (vec (for [[stage reports] (group-by :stage @reports)]
+                          {:stage stage
+                           :start-ms (apply min (map :start-ms reports))
+                           :end-ms (apply max (map :end-ms reports))}))
            :metrics (vec (for [{:keys [stage, metrics]} @reports
                                metric metrics]
                            (assoc metric :stage stage)))
            :system system
            :start-ms start-ms
-           :end-ms (System/currentTimeMillis)
-
-           ;; todo remove below (flat stages/metrics better)
-           :reports @reports
-
-           }
-          )))))
+           :end-ms (System/currentTimeMillis)})))))
 
 (defn add-report [worker report]
   (swap! (:reports worker) conj report))

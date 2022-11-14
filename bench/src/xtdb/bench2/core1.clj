@@ -264,23 +264,28 @@
     {:dir "bench"}
     (bt/sh "lein" "install")))
 
+(def ^:dynamic *rocks-stats-cubby-hole*)
+
 (defn undata-node-opts [{:keys [index, log, docs]}]
-  (let [rocks-kv (fn [] {:xtdb/module 'xtdb.rocksdb/->kv-store,
+  (let [rocks-kv (fn [k] {:xtdb/module 'xtdb.rocksdb/->kv-store,
+                         :metrics (fn [_]
+                                    (fn [_db stats]
+                                      (set! *rocks-stats-cubby-hole* (assoc *rocks-stats-cubby-hole* k stats))))
                          :db-dir (xio/create-tmpdir "kv")
                          :db-dir-suffix "kv"})
         lmdb-kv (fn [] {:xtdb/module 'xtdb.lmdb/->kv-store,
                         :db-dir (xio/create-tmpdir "kv")
                         :db-dir-suffix "kv"})
-        undata (fn [t]
+        undata (fn [k t]
                  (case t
                    nil {}
                    :rocks
-                   {:kv-store (rocks-kv)}
+                   {:kv-store (rocks-kv k)}
                    :lmdb
                    {:kv-store (lmdb-kv)}))]
-    {:xtdb/tx-log (undata log)
-     :xtdb/document-store (undata docs)
-     :xtdb/index-store (undata index)}))
+    {:xtdb/tx-log (undata :log log)
+     :xtdb/document-store (undata :docs docs)
+     :xtdb/index-store (undata :index index)}))
 
 (defn run-benchmark
   [{:keys [node-opts
@@ -292,9 +297,17 @@
           ((requiring-resolve 'xtdb.bench2.auctionmark/benchmark) benchmark-opts)
           :tpch
           ((requiring-resolve 'xtdb.bench2.tpch/benchmark) benchmark-opts))
-        benchmark-fn (b2/compile-benchmark benchmark wrap-task)]
-    (with-open [node (xt/start-node (undata-node-opts node-opts))]
-      (benchmark-fn node))))
+        benchmark-fn (b2/compile-benchmark
+                       benchmark
+                       (let [rocks-wrap (xtdb.bench2.rocksdb/stage-wrapper
+                                          (fn [_]
+                                            *rocks-stats-cubby-hole*))]
+                         (fn [task f]
+                           (-> (wrap-task task f)
+                               (cond->> (:stage task) (rocks-wrap task))))))]
+    (binding [*rocks-stats-cubby-hole* {}]
+      (with-open [node (xt/start-node (undata-node-opts node-opts))]
+        (benchmark-fn node)))))
 
 (defn build-jar
   [{:keys [repository
@@ -447,6 +460,7 @@
   ;; Running in process
   ;; ======
 
+  (def run-duration "PT30S")
   (def run-duration "PT2M")
   (def run-duration "PT10M")
 
