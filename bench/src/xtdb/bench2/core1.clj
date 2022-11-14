@@ -11,7 +11,7 @@
             [clojure.edn :as edn]
             [clojure.string :as str])
   (:import (io.micrometer.core.instrument MeterRegistry Timer Tag Timer$Sample)
-           (java.time Duration)
+           (java.time Duration LocalDateTime)
            (java.util.concurrent.atomic AtomicLong)
            (java.io Closeable File)))
 
@@ -429,6 +429,18 @@
     `((requiring-resolve 'xtdb.bench2.core1/ec2-run-benchmark*) ~run-benchmark-opts ~report-s3-path)
     {:env env
      :java-opts java-opts}))
+
+(defn run-test [{:keys [ec2, s3-jar, env, java-opts, run-benchmark-opts, report-s3-path]}]
+  (ec2-get-jar ec2 s3-jar)
+  (ec2-use-jar ec2 s3-jar)
+  (ec2-run-benchmark
+    ec2
+    {:env env
+     :java-opts java-opts
+     :run-benchmark-opts run-benchmark-opts
+     :report-s3-path report-s3-path}))
+
+
 
 (comment
   ;; ======
