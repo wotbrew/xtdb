@@ -18,7 +18,7 @@
 (set! *warn-on-reflection* false)
 
 (defn generate [worker f n]
-  (let [doc-seq (repeatedly n (partial f worker))
+  (let [doc-seq (remove nil? (repeatedly (long n) (partial f worker)))
         partition-count 512]
     (doseq [chunk (partition-all partition-count doc-seq)]
       (xt/submit-tx (:sut worker) (mapv (partial vector ::xt/put) chunk)))))
@@ -162,15 +162,15 @@
 
       ;; record on both branches as older versions of xt do not have the arity-3 version
       (submit-tx [this tx-ops]
-        (let [ret (.recordCallable ^Timer submit-tx-timer ^Callable (fn [] (xt/submit-tx node tx-ops)))]
-          (reset! last-submitted [ret (System/currentTimeMillis)])
-          (.incrementAndGet submit-counter)
-          ret))
+                 (let [ret (.recordCallable ^Timer submit-tx-timer ^Callable (fn [] (xt/submit-tx node tx-ops)))]
+                   (reset! last-submitted [ret (System/currentTimeMillis)])
+                   (.incrementAndGet submit-counter)
+                   ret))
       (submit-tx [_ tx-ops opts]
-        (let [ret (.recordCallable ^Timer submit-tx-timer ^Callable (fn [] (xt/submit-tx node tx-ops opts)))]
-          (reset! last-submitted [ret (System/currentTimeMillis)])
-          (.incrementAndGet submit-counter)
-          ret))
+                 (let [ret (.recordCallable ^Timer submit-tx-timer ^Callable (fn [] (xt/submit-tx node tx-ops opts)))]
+                   (reset! last-submitted [ret (System/currentTimeMillis)])
+                   (.incrementAndGet submit-counter)
+                   ret))
 
       (open-tx-log [_ after-tx-id with-ops?] (xt/open-tx-log node after-tx-id with-ops?))
       xt/DBProvider
@@ -180,8 +180,8 @@
       (open-db [_ valid-time-or-basis] (xt/open-db node valid-time-or-basis))
       Closeable
       (close [_]
-        (.close on-query-listener)
-        (.close on-indexed-listener)))))
+             (.close on-query-listener)
+             (.close on-indexed-listener)))))
 
 (defn wrap-task [task f]
   (let [{:keys [stage]} task]
@@ -268,11 +268,11 @@
 
 (defn undata-node-opts [{:keys [index, log, docs]}]
   (let [rocks-kv (fn [k] {:xtdb/module 'xtdb.rocksdb/->kv-store,
-                         :metrics (fn [_]
-                                    (fn [_db stats]
-                                      (set! *rocks-stats-cubby-hole* (assoc *rocks-stats-cubby-hole* k stats))))
-                         :db-dir (xio/create-tmpdir "kv")
-                         :db-dir-suffix "kv"})
+                          :metrics (fn [_]
+                                     (fn [_db stats]
+                                       (set! *rocks-stats-cubby-hole* (assoc *rocks-stats-cubby-hole* k stats))))
+                          :db-dir (xio/create-tmpdir "kv")
+                          :db-dir-suffix "kv"})
         lmdb-kv (fn [] {:xtdb/module 'xtdb.lmdb/->kv-store,
                         :db-dir (xio/create-tmpdir "kv")
                         :db-dir-suffix "kv"})
@@ -286,6 +286,9 @@
     {:xtdb/tx-log (undata :log log)
      :xtdb/document-store (undata :docs docs)
      :xtdb/index-store (undata :index index)}))
+
+;; remove this we figure it out
+(require 'xtdb.bench2.rocksdb)
 
 (defn run-benchmark
   [{:keys [node-opts
@@ -672,5 +675,50 @@
 
   ;; CLEANUP! delete your node when finished with it
   (ec2/cfn-stack-delete ec2-stack-id)
+
+  )
+
+(comment
+
+  ;; perf1
+  (ec2/provision "bench-ingest-perf1" {:instance "m5.large"})
+
+  (def ec2 (ec2/handle (ec2/cfn-stack-describe "bench-ingest-perf1")))
+
+  (ec2-setup ec2)
+
+  (defn dobench [repo version]
+    (let [r1-path (new-s3-report-path)
+          jar-1 (s3-upload-jar (build-jar {:version version, :repository repo, :modules [:rocks]}))
+          _ (ec2-get-jar ec2 jar-1)
+          _ (ec2-use-jar ec2 jar-1)
+          {:keys [out, err]}
+          (binding [bt/*sh-ret* :map]
+            (ec2-run-benchmark
+              ec2
+              {:env {"MALLOC_ARENA_MAX" 2}
+               :java-opts ["--add-opens java.base/java.util.concurrent=ALL-UNNAMED"]
+               :run-benchmark-opts
+               {:node-opts {:index :rocks, :log :rocks, :docs :rocks}
+                :benchmark-type :auctionmark
+                :benchmark-opts {:duration "PT5M"}}
+               :report-s3-path r1-path}))
+          r1-file (File/createTempFile "report" ".edn")]
+      (println out)
+      (println "ERR")
+      (println err)
+      (bt/aws "s3" "cp" r1-path (.getAbsolutePath r1-file))
+      (edn/read-string (slurp r1-file))))
+
+  (def r1 (dobench "git@github.com:xtdb/xtdb.git" "master"))
+  (def r2 (dobench "git@github.com:wotbrew/xtdb.git" "ingest-perf1"))
+
+  (require 'xtdb.bench2.report)
+  (xtdb.bench2.report/show-html-report
+    (xtdb.bench2.report/vs
+      "master"
+      r1
+      "ingest pass"
+      r2))
 
   )

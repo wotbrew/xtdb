@@ -18,7 +18,7 @@
 (def global-attribute-group-id (partial str "gag_"))
 (def global-attribute-value-id (partial str "gav_"))
 
-(def user-attribute (b2/id))
+(def user-attribute-id (partial str "ua_"))
 (def item-name (b2/id))
 (def item-description (b2/id))
 (def initial-price (b2/id))
@@ -28,27 +28,30 @@
 (def item-image-path (b2/id))
 (def auction-start-date (b2/id))
 
+(defn generate-user [worker]
+  (let [u_id (b2/increment worker user-id)]
+    {:xt/id u_id
+     :u_id u_id
+     :u_r_id (b2/sample-flat worker region-id)
+     :u_rating 0
+     :u_balance 0.0
+     :u_created (b2/current-timestamp worker)
+     :u_sattr0 (b2/random-str worker)
+     :u_sattr1 (b2/random-str worker)
+     :u_sattr2 (b2/random-str worker)
+     :u_sattr3 (b2/random-str worker)
+     :u_sattr4 (b2/random-str worker)
+     :u_sattr5 (b2/random-str worker)
+     :u_sattr6 (b2/random-str worker)
+     :u_sattr7 (b2/random-str worker)}))
+
 (defn proc-new-user
   "Creates a new USER record. The rating and balance are both set to zero.
 
   The benchmark randomly selects id from a pool of region ids as an input for u_r_id parameter using flat distribution."
   [worker]
-  (let [u_id (b2/increment worker user-id)]
-    (->> [[::xt/put {:xt/id u_id
-                     :u_id u_id
-                     :u_r_id (b2/sample-flat worker region-id)
-                     :u_rating 0
-                     :u_balance 0.0
-                     :u_created (b2/current-timestamp worker)
-                     :u_sattr0 (b2/random-str worker)
-                     :u_sattr1 (b2/random-str worker)
-                     :u_sattr2 (b2/random-str worker)
-                     :u_sattr3 (b2/random-str worker)
-                     :u_sattr4 (b2/random-str worker)
-                     :u_sattr5 (b2/random-str worker)
-                     :u_sattr6 (b2/random-str worker)
-                     :u_sattr7 (b2/random-str worker)}]]
-         (xt/submit-tx (:sut worker)))))
+  (->> [[::xt/put (generate-user worker)]]
+       (xt/submit-tx (:sut worker))))
 
 (def tx-fn-apply-seller-fee
   '(fn apply-seller-fee [ctx u_id]
@@ -357,6 +360,35 @@
      :c_parent_id (when (seq parent) (:id (categories parent)))
      :c_name (or category-name (b2/random-str worker 6 32))}))
 
+(defn generate-user-attributes [worker]
+  (let [u_id (b2/sample-flat worker user-id)
+        ua-id (b2/increment worker user-attribute-id)]
+    (when u_id
+      {:xt/id ua-id
+       :ua_u_id u_id
+       :ua_name (b2/random-str worker 5 32)
+       :ua_value (b2/random-str worker 5 32)
+       :u_created (b2/current-timestamp worker)})))
+
+(defn generate-item [worker]
+  (let [i_id (b2/increment worker item-id)
+        i_u_id (b2/sample-flat worker user-id)
+        i_c_id (sample-category-id worker)]
+    (when i_u_id
+      {:xt/id i_id
+       :i_u_id i_u_id
+       :i_c_id i_c_id
+       :i_name (b2/random-str worker 6 32)
+       :i_description (b2/random-str worker 50 255)
+       :i_user_attributes (b2/random-str worker 20 255)
+       :i_initial_price (random-price worker)
+       :i_current_price (random-price worker)
+       :i_num_bids 0
+       :i_num_images 0
+       :i_num_global_attrs 0
+       :i_start_date (b2/current-timestamp worker)
+       :i_end_date (.plus ^Instant (b2/current-timestamp worker) (Duration/ofDays 32))})))
+
 (defn benchmark [{:keys [seed,
                          threads,
                          duration
@@ -365,16 +397,21 @@
                        threads 8,
                        duration "PT30S"
                        sync false}}]
-  (let [duration (Duration/parse duration)]
+  (let [duration (Duration/parse duration)
+        sf 0.1]
     {:title "Auction Mark OLTP"
      :seed seed
      :tasks
      [{:t :do
        :stage :load
-       :tasks [{:t :call :f [bcore1/install-tx-fns {:apply-seller-fee tx-fn-apply-seller-fee, :new-bid tx-fn-new-bid}]}
-               {:t :call :f load-categories-tsv}
-               {:t :call :f [bcore1/generate generate-region 75]}
-               {:t :call :f [bcore1/generate generate-category 16908]}]}
+       :tasks [{:t :call, :f [bcore1/install-tx-fns {:apply-seller-fee tx-fn-apply-seller-fee, :new-bid tx-fn-new-bid}]}
+               {:t :call, :f load-categories-tsv}
+               {:t :call, :f [bcore1/generate generate-region 75]}
+               {:t :call, :f [bcore1/generate generate-category 16908]}
+               {:t :call, :f [bcore1/generate generate-user (* sf 1e6)]}
+               {:t :call, :f [bcore1/generate generate-user-attributes (* sf 1e6 1.3)]}
+               {:t :call, :f [bcore1/generate generate-item (* sf 1e6 10)]}
+               {:t :call, :f [(comp xt/sync :sut)]}]}
       {:t :concurrently
        :stage :oltp
        :duration duration
@@ -385,10 +422,10 @@
                        :thread-count threads
                        :think Duration/ZERO
                        :pooled-task {:t :pick-weighted
-                                     :choices [[{:t :call, :transaction :get-item :f proc-get-item} 12.0]
-                                               [{:t :call, :transaction :new-user :f proc-new-user} 0.5]
-                                               [{:t :call, :transaction :new-item :f proc-new-item} 1.0]
-                                               [{:t :call, :transaction :new-bid :f proc-new-bid} 2.0]]}}
+                                     :choices [[{:t :call, :transaction :get-item, :f proc-get-item} 12.0]
+                                               [{:t :call, :transaction :new-user, :f proc-new-user} 0.5]
+                                               [{:t :call, :transaction :new-item, :f proc-new-item} 1.0]
+                                               [{:t :call, :transaction :new-bid, :f proc-new-bid} 2.0]]}}
                       {:t :freq-job
                        :duration duration
                        :freq (Duration/ofMillis (* 0.2 (.toMillis duration)))
