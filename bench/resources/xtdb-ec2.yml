@@ -51,6 +51,13 @@ Resources:
         !Ref InstanceAMI
       SecurityGroups:
         - !Ref InstanceSecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp2
+            VolumeSize: 100
+            DeleteOnTermination: true
+            Encrypted: false
   InstanceSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
