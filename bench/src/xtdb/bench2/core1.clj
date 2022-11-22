@@ -9,11 +9,18 @@
             [clojure.java.io :as io]
             [clojure.java.shell :as sh]
             [clojure.edn :as edn]
-            [clojure.string :as str])
-  (:import (io.micrometer.core.instrument MeterRegistry Timer Tag Timer$Sample)
-           (java.time Duration LocalDateTime)
+            [clojure.string :as str]
+            [juxt.clojars-mirrors.nippy.v3v1v1.taoensso.nippy :as nippy]
+            [xtdb.kv :as kv]
+            [xtdb.memory :as mem]
+            [clojure.spec.alpha :as s])
+  (:import (java.time Duration)
            (java.util.concurrent.atomic AtomicLong)
-           (java.io Closeable File)))
+           (java.io Closeable File DataOutputStream DataInputStream)
+           (java.util Date HashMap ArrayList)
+           (clojure.lang PersistentArrayMap)
+           (java.security MessageDigest)
+           (io.micrometer.core.instrument MeterRegistry Timer Tag Timer$Sample)))
 
 (set! *warn-on-reflection* false)
 
@@ -162,15 +169,15 @@
 
       ;; record on both branches as older versions of xt do not have the arity-3 version
       (submit-tx [this tx-ops]
-                 (let [ret (.recordCallable ^Timer submit-tx-timer ^Callable (fn [] (xt/submit-tx node tx-ops)))]
-                   (reset! last-submitted [ret (System/currentTimeMillis)])
-                   (.incrementAndGet submit-counter)
-                   ret))
+        (let [ret (.recordCallable ^Timer submit-tx-timer ^Callable (fn [] (xt/submit-tx node tx-ops)))]
+          (reset! last-submitted [ret (System/currentTimeMillis)])
+          (.incrementAndGet submit-counter)
+          ret))
       (submit-tx [_ tx-ops opts]
-                 (let [ret (.recordCallable ^Timer submit-tx-timer ^Callable (fn [] (xt/submit-tx node tx-ops opts)))]
-                   (reset! last-submitted [ret (System/currentTimeMillis)])
-                   (.incrementAndGet submit-counter)
-                   ret))
+        (let [ret (.recordCallable ^Timer submit-tx-timer ^Callable (fn [] (xt/submit-tx node tx-ops opts)))]
+          (reset! last-submitted [ret (System/currentTimeMillis)])
+          (.incrementAndGet submit-counter)
+          ret))
 
       (open-tx-log [_ after-tx-id with-ops?] (xt/open-tx-log node after-tx-id with-ops?))
       xt/DBProvider
@@ -180,8 +187,8 @@
       (open-db [_ valid-time-or-basis] (xt/open-db node valid-time-or-basis))
       Closeable
       (close [_]
-             (.close on-query-listener)
-             (.close on-indexed-listener)))))
+        (.close on-query-listener)
+        (.close on-indexed-listener)))))
 
 (defn wrap-task [task f]
   (let [{:keys [stage]} task]
@@ -270,7 +277,8 @@
   (let [rocks-kv (fn [k] {:xtdb/module 'xtdb.rocksdb/->kv-store,
                           :metrics (fn [_]
                                      (fn [_db stats]
-                                       (set! *rocks-stats-cubby-hole* (assoc *rocks-stats-cubby-hole* k stats))))
+                                       (when (thread-bound? #'*rocks-stats-cubby-hole*)
+                                         (set! *rocks-stats-cubby-hole* (assoc *rocks-stats-cubby-hole* k stats)))))
                           :db-dir (xio/create-tmpdir "kv")
                           :db-dir-suffix "kv"})
         lmdb-kv (fn [] {:xtdb/module 'xtdb.lmdb/->kv-store,
@@ -290,6 +298,8 @@
 ;; remove this we figure it out
 (require 'xtdb.bench2.rocksdb)
 
+(declare trace)
+
 (defn run-benchmark
   [{:keys [node-opts
            benchmark-type
@@ -299,7 +309,8 @@
           :auctionmark
           ((requiring-resolve 'xtdb.bench2.auctionmark/benchmark) benchmark-opts)
           :tpch
-          ((requiring-resolve 'xtdb.bench2.tpch/benchmark) benchmark-opts))
+          ((requiring-resolve 'xtdb.bench2.tpch/benchmark) benchmark-opts)
+          :trace (trace benchmark-opts))
         benchmark-fn (b2/compile-benchmark
                        benchmark
                        (let [rocks-wrap (xtdb.bench2.rocksdb/stage-wrapper
@@ -456,7 +467,211 @@
      :run-benchmark-opts run-benchmark-opts
      :report-s3-path report-s3-path}))
 
+;; tx seq, database as a file we can
+;; record a trace and then repeat the indexing
 
+(defn tx-seq
+  [node]
+  (let [rewrite-op
+        (fn ! [st op]
+          (case (nth op 0)
+            (::xt/put ::xt/delete) (conj! st op)
+            ;; redundant
+            ::xt/match st
+            ::xt/fn
+            (let [[_ _ tx] op] (reduce ! st (::xt/tx-ops tx)))))
+
+        rewrite-tx
+        (fn [tx]
+          (let [ops (persistent! (reduce rewrite-op (transient []) (::xt/tx-ops tx)))]
+            (when (seq ops)
+              (assoc tx ::xt/tx-ops ops))))]
+    ((fn tx-seq-next [after]
+       (lazy-seq
+         (let [batch (with-open [c (xt/open-tx-log node after true)]
+                       (into [] (comp (keep rewrite-tx) (take 4096)) (iterator-seq c)))]
+           (if (= 4096 (count batch))
+             (concat batch (tx-seq-next (::xt/tx-id (peek batch))))
+             batch)))) -1)))
+
+(defn write-tx-op [^DataOutputStream out, encode-fn, op tx]
+  (case (nth op 0)
+    ::xt/put
+    (let [[_ doc valid-start valid-end] op]
+      ;; put
+      (.write out (byte 1))
+
+      (if valid-start
+        (.writeLong out (long (inst-ms valid-start)))
+        (.writeLong out (long (inst-ms (::xt/tx-time tx)))))
+
+      (if valid-end
+        (.writeLong out (long (inst-ms valid-end)))
+        (.writeLong out -1))
+
+      (encode-fn out doc))
+    ::xt/delete
+    (let [[_ id] op]
+      (.write out (byte 2))
+      (encode-fn out id))))
+
+(defn write-clj-tx
+  [^DataOutputStream out,
+   encode-fn
+   tx]
+  ;; begin tx
+  (.write out (byte 1))
+  (.writeLong out (long (::xt/tx-id tx)))
+  (.writeLong out (long (inst-ms (::xt/tx-time tx))))
+  (.writeInt out (count (::xt/tx-ops tx)))
+  (doseq [op (::xt/tx-ops tx)]
+    (write-tx-op out encode-fn op tx))
+  ;; end tx
+  (.write out (byte 0)))
+
+(defn read-clj-tx
+  [^DataInputStream in,
+   decode-fn]
+  (let [tx-id (.readLong in)
+        tx-time (Date. (.readLong in))
+        tx-op-count (.readInt in)
+        op-buf (object-array tx-op-count)
+        _ (dotimes [i tx-op-count]
+            (case (int (.read in))
+              0 nil
+              ;; put
+              1 (let [valid-start-ms (.readLong in)
+                      valid-end-ms (.readLong in)]
+                  (aset op-buf i [::xt/put (decode-fn in)
+                                  (Date. valid-start-ms)
+                                  (when (not= -1 valid-end-ms) (Date. valid-end-ms))]))
+              ;; delete
+              2 (aset op-buf i [::xt/delete (decode-fn in)])))
+        tx-ops (seq op-buf)]
+
+    (when-not (= 0 (.read in)) (throw (ex-info "Corrupt xt stream" {})))
+
+    {::xt/tx-id tx-id
+     ::xt/tx-time tx-time
+     ::xt/tx-ops tx-ops}))
+
+(defn write-tx-seq [^DataOutputStream out tx-seq]
+  (let [symbol-table (HashMap.)
+        nippy nippy/freeze-to-out!
+        encode-kv (fn [^DataOutputStream out k v]
+                    (if-some [sym (.get symbol-table k)]
+                      (do (.write out (byte 0))
+                          (.writeInt out (int sym)))
+                      (do (.write out (byte 1))
+                          ;; todo overflow
+                          (let [off (.size symbol-table)]
+                            (nippy out k)
+                            (.put symbol-table k off))))
+                    (nippy out v)
+                    out)
+        encode-fn (fn [^DataOutputStream out doc]
+                    (.writeInt out (count doc))
+                    (reduce-kv encode-kv out doc))]
+    (doseq [tx tx-seq]
+      (write-clj-tx out encode-fn tx))))
+
+(defn spit-tx-seq [file tx-seq]
+  (with-open [out (io/output-stream file)
+              dout (DataOutputStream. out)]
+    (write-tx-seq dout tx-seq)))
+
+(defn read-tx-seq [^DataInputStream in]
+  (let [buf-size 64
+        symbol-table (ArrayList.)
+        nippy nippy/thaw-from-in!
+        decode-fn (fn [^DataInputStream in]
+                    (let [len (.readInt in)
+                          buf (object-array (* 2 len))]
+                      (dotimes [i len]
+                        (aset buf (* i 2)
+                              (if (= 0 (.read in))
+                                (.get symbol-table (.readInt in))
+                                (let [k (nippy in)]
+                                  (.add symbol-table k)
+                                  k)))
+                        (aset buf (inc (* i 2)) (nippy in)))
+                      (PersistentArrayMap. buf)))]
+    ((fn read-next []
+       (lazy-seq
+         (loop [buf (object-array buf-size)]
+           (loop [i 0]
+             (cond
+               (= i buf-size) (concat buf (read-next))
+               (= 1 (.read in)) (do (aset buf i (read-clj-tx in decode-fn)) (recur (unchecked-inc-int i)))
+               :else (take i buf)))))))))
+
+(defn build-trace [benchmark file]
+  (let [opts (undata-node-opts
+               {:index :rocks,
+                :log :rocks,
+                :docs :rocks})]
+    (try
+      (with-open [node (xt/start-node opts)]
+        (let [f (b2/compile-benchmark benchmark wrap-task)]
+          (f node))
+        (xt/sync node)
+        (spit-tx-seq file (tx-seq node))
+        file)
+      (finally
+        (doseq [[_ {:keys [kv-store]}] opts
+                :let [dir (:db-dir kv-store)]
+                :when dir]
+          (.delete (io/file dir)))))))
+
+(defn run-trace [node file]
+  (with-open [in (io/input-stream file)
+              din (DataInputStream. in)]
+    (run! #(xt/submit-tx node %) (map ::xt/tx-ops (read-tx-seq din)))
+    (xt/sync node)))
+
+(defn trace [{:keys [file]}]
+  {:title "Trace"
+   :seed 0
+   :tasks [{:t :call, :stage :trace, :f (fn [{node :sut}] (run-trace node file))}]})
+
+(defn kv-seq [kv-snapshot]
+  ((fn kv-seq-chunk [start]
+     (lazy-seq
+       (with-open [iter (kv/new-iterator kv-snapshot)]
+         (let [buf (ArrayList. 4096)
+               add (fn [k v]
+                     (.add buf [(some-> k mem/->on-heap) (some-> v mem/->on-heap)]))]
+
+           (when-some [k (kv/seek iter start)]
+             (add k (kv/value iter))
+
+             (loop [i 0]
+               (when (< i 4096)
+                 (when-some [k (kv/next iter)]
+                   (add k (kv/value iter))
+                   (recur (inc i)))))
+
+             (concat
+               (seq buf)
+               (when-some [k (kv/next iter)]
+                 (let [next-start (mem/->on-heap k)]
+                   (when (seq next-start)
+                     (kv-seq-chunk next-start))))))))))
+   (byte-array [0])))
+
+(defn index-checksum [node]
+  (when-some [kv-store (-> node :index-store :kv-store)]
+    (let [digest (MessageDigest/getInstance "md5")]
+      (with-open [snap (kv/new-snapshot kv-store)]
+        (doseq [[k v] (kv-seq snap)]
+          (.update digest ^bytes k)
+          (.update digest ^bytes v)))
+      (.toString (BigInteger. 1 (.digest digest)) 16))))
+
+(defn run-trace-check [node file]
+  (run-trace node file)
+  (Thread/sleep 1000)
+  {:index (index-checksum node)})
 
 (comment
   ;; ======
@@ -720,5 +935,73 @@
       r1
       "ingest pass"
       r2))
+
+  )
+
+(comment
+
+  ;; perf1, trace
+  (ec2/provision "bench-ingest-perf1" {:instance "m5.large"})
+
+  (def ec2 (ec2/handle (ec2/cfn-stack-describe "bench-ingest-perf1")))
+
+  (ec2-setup ec2)
+
+  (defn dobencht [repo version]
+    (let [r1-path (new-s3-report-path)
+          jar-1 (s3-upload-jar (build-jar {:version version, :repository repo, :modules [:rocks]}))
+          _ (ec2-get-jar ec2 jar-1)
+          _ (ec2-use-jar ec2 jar-1)
+          _ (ec2/ssh ec2 "aws" "s3" "cp" "s3://xtdb-bench/b2/amtrace.bin" "amtrace.bin")
+          {:keys [out, err]}
+          (binding [bt/*sh-ret* :map]
+            (ec2-run-benchmark
+              ec2
+              {:env {"MALLOC_ARENA_MAX" 2}
+               :java-opts ["--add-opens java.base/java.util.concurrent=ALL-UNNAMED"]
+               :run-benchmark-opts
+               {:node-opts {:index :rocks, :log :rocks, :docs :rocks}
+                :benchmark-type :trace
+                :benchmark-opts {:file "amtrace.bin"}}
+               :report-s3-path r1-path}))
+          r1-file (File/createTempFile "report" ".edn")]
+      (println out)
+      (println "ERR")
+      (println err)
+      (bt/aws "s3" "cp" r1-path (.getAbsolutePath r1-file))
+      (edn/read-string (slurp r1-file))))
+
+  (def r1t (dobencht "git@github.com:xtdb/xtdb.git" "master"))
+  (def r2t (dobencht "git@github.com:wotbrew/xtdb.git" "ingest-perf1"))
+
+  (require 'xtdb.bench2.report)
+  (xtdb.bench2.report/show-html-report
+    (xtdb.bench2.report/vs
+      "master"
+      r1t
+      "ingest pass"
+      r2t))
+
+  )
+
+(comment
+
+  (s/check-asserts false)
+
+  (let [opts (undata-node-opts
+               {:index :rocks,
+                :log :rocks,
+                :docs :rocks})]
+    (try
+      (with-open [node (xt/start-node opts)]
+        (run-trace-check node "amtrace.bin"))
+      (finally
+        (doseq [[_ {:keys [kv-store]}] opts
+                :let [dir (:db-dir kv-store)]
+                :when dir]
+          (.delete (io/file dir))))))
+
+  ;; master/bench fd6ec3fe7f71535fac2a50e55da505d5
+  ;; perf1 1b94e67eb0aae841efe21f52d66f63b9
 
   )
