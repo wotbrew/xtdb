@@ -623,11 +623,18 @@
                 :when dir]
           (.delete (io/file dir)))))))
 
-(defn run-trace [node file]
-  (with-open [in (io/input-stream file)
-              din (DataInputStream. in)]
-    (run! #(xt/submit-tx node %) (map ::xt/tx-ops (read-tx-seq din)))
-    (xt/sync node)))
+(defn run-trace
+  ([node file] (run-trace node file nil))
+  ([node file n]
+   (with-open [in (io/input-stream file)
+               din (DataInputStream. in)]
+     (->> (read-tx-seq din)
+          ((fn [tx-seq] (if n (take n tx-seq) tx-seq)))
+          (map-indexed
+            (fn [i {::xt/keys [tx-ops]}]
+              (xt/submit-tx node tx-ops {::xt/tx-time (Date. (long i))})))
+          dorun)
+     (xt/sync node))))
 
 (defn trace [{:keys [file]}]
   {:title "Trace"
@@ -668,8 +675,8 @@
           (.update digest ^bytes v)))
       (.toString (BigInteger. 1 (.digest digest)) 16))))
 
-(defn run-trace-check [node file]
-  (run-trace node file)
+(defn run-trace-check [node file n]
+  (run-trace node file n)
   (Thread/sleep 1000)
   {:index (index-checksum node)})
 
@@ -994,14 +1001,14 @@
                 :docs :rocks})]
     (try
       (with-open [node (xt/start-node opts)]
-        (run-trace-check node "amtrace.bin"))
+        (run-trace-check node "amtrace.bin" nil))
       (finally
         (doseq [[_ {:keys [kv-store]}] opts
                 :let [dir (:db-dir kv-store)]
                 :when dir]
           (.delete (io/file dir))))))
 
-  ;; master/bench fd6ec3fe7f71535fac2a50e55da505d5
-  ;; perf1 1b94e67eb0aae841efe21f52d66f63b9
+  ;; master/bench 4986669a3c0d4121f26cf00f54a79c0e
+  ;; perf1 4986669a3c0d4121f26cf00f54a79c0e
 
   )
