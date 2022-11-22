@@ -392,13 +392,15 @@
 (defn benchmark [{:keys [seed,
                          threads,
                          duration
-                         sync]
+                         sync
+                         scale-factor]
                   :or {seed 0,
                        threads 8,
                        duration "PT30S"
-                       sync false}}]
+                       sync false
+                       scale-factor 0.1}}]
   (let [duration (Duration/parse duration)
-        sf 0.1]
+        sf scale-factor]
     {:title "Auction Mark OLTP"
      :seed seed
      :tasks
