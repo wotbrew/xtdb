@@ -43,8 +43,9 @@
 
 (set! *unchecked-math* :warn-on-boxed)
 
-(def ^:const column-family-defs [c/entity+vt+tt+tx-id->content-hash-index-id
-                                 c/entity+z+tx-id->content-hash-index-id])
+(def column-family-defs
+  [{:id-byte c/entity+vt+tt+tx-id->content-hash-index-id, :prefix-len (+ c/id-size c/index-id-size)}
+   {:id-byte c/entity+z+tx-id->content-hash-index-id}])
 
 (defn- iterator->key [^RocksIterator i]
   (when (.isValid i)
@@ -117,6 +118,7 @@
       (->RocksKvTxSnapshot db
                            ->column-family-handle
                            (doto (ReadOptions.)
+                             (.setAutoPrefixMode true)
                              (.setSnapshot snapshot))
                            snapshot
                            wb)))
@@ -178,6 +180,7 @@
       (->RocksKvSnapshot db
                          ->column-family-handle
                          (doto (ReadOptions.)
+                           (.setAutoPrefixMode true)
                            (.setSnapshot snapshot))
                          snapshot)))
 
@@ -230,7 +233,7 @@
 (def ^:private cp-format {:index-version c/index-version, ::version "7"})
 
 (defn ->lru-block-cache {::sys/args {:cache-size {:doc "Cache size"
-                                                  :default (* 8 1024 1024)
+                                                  :default (* 512 1024 1024)
                                                   :spec ::sys/nat-int}}}
   [{:keys [cache-size]}]
   (LRUCache. cache-size))
@@ -268,24 +271,41 @@
 
         _ (when block-cache
             (.setTableFormatConfig default-cfo (doto (BlockBasedTableConfig.)
-                                                 (.setBlockCache block-cache))))
+                                                 (.setBlockCache block-cache)
 
-        cfo (doto (ColumnFamilyOptions.)
-              (.setCompressionType CompressionType/LZ4_COMPRESSION)
-              (.setBottommostCompressionType CompressionType/ZSTD_COMPRESSION))
-
-        _ (when block-cache
-            (.setTableFormatConfig cfo (doto (BlockBasedTableConfig.)
-                                         (.setBlockCache block-cache))))
+                                                 (.setCacheIndexAndFilterBlocks true)
+                                                 (.setPinL0FilterAndIndexBlocksInCache true))))
 
         column-family-descriptors
         (into [(ColumnFamilyDescriptor. RocksDB/DEFAULT_COLUMN_FAMILY default-cfo)]
-              (for [c column-family-defs]
-                (ColumnFamilyDescriptor. (byte-array [(byte c)]) cfo)))
+              (for [{:keys [id-byte, prefix-len]} column-family-defs
+                    :let [cfo (doto (ColumnFamilyOptions.)
+                                (.setCompressionType CompressionType/LZ4_COMPRESSION)
+                                (.setBottommostCompressionType CompressionType/ZSTD_COMPRESSION))
+
+                          table-config
+                          (doto (BlockBasedTableConfig.))
+
+                          _ (when block-cache
+                              (doto table-config
+                                (.setBlockCache block-cache)
+                                (.setCacheIndexAndFilterBlocks true)
+                                (.setPinL0FilterAndIndexBlocksInCache true)))
+
+                          _ (when prefix-len
+                              (.useFixedLengthPrefixExtractor cfo (int prefix-len))
+                              (.setFilterPolicy table-config (BloomFilter.))
+                              (.setOptimizeFiltersForMemory table-config true)
+                              (.setMemtablePrefixBloomSizeRatio cfo 0.05))
+
+                          _ (.setTableFormatConfig cfo table-config)
+                          ]]
+                (ColumnFamilyDescriptor. (byte-array [id-byte]) cfo)))
 
         column-family-handles-vector (java.util.Vector.)
 
         stats (when metrics (doto (Statistics.) (.setStatsLevel (StatsLevel/EXCEPT_DETAILED_TIMERS))))
+
         opts (doto (or ^DBOptions db-options (DBOptions.))
                (cond-> metrics (.setStatistics stats))
                (.setCreateIfMissing true)
@@ -303,7 +323,7 @@
         metrics (when metrics (metrics db stats))
         column-family-handles (into {}
                                     (for [[^int i cfd] (map-indexed vector column-family-defs)]
-                                      [cfd (.get column-family-handles-vector (inc i))]))
+                                      [(:id-byte cfd) (.get column-family-handles-vector (inc i))]))
 
         ^objects cf-handle-array
         (let [max-cf-id (apply max (keys column-family-handles))
