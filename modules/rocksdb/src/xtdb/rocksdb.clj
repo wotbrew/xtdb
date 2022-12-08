@@ -118,7 +118,7 @@
       (->RocksKvTxSnapshot db
                            ->column-family-handle
                            (doto (ReadOptions.)
-                             (.setAutoPrefixMode true)
+                             (.setPrefixSameAsStart true)
                              (.setSnapshot snapshot))
                            snapshot
                            wb)))
@@ -180,7 +180,7 @@
       (->RocksKvSnapshot db
                          ->column-family-handle
                          (doto (ReadOptions.)
-                           (.setAutoPrefixMode true)
+                           (.setPrefixSameAsStart true)
                            (.setSnapshot snapshot))
                          snapshot)))
 
@@ -272,9 +272,8 @@
         _ (when block-cache
             (.setTableFormatConfig default-cfo (doto (BlockBasedTableConfig.)
                                                  (.setBlockCache block-cache)
-
                                                  (.setCacheIndexAndFilterBlocks true)
-                                                 (.setPinL0FilterAndIndexBlocksInCache true))))
+                                                 (.setCacheIndexAndFilterBlocksWithHighPriority true))))
 
         column-family-descriptors
         (into [(ColumnFamilyDescriptor. RocksDB/DEFAULT_COLUMN_FAMILY default-cfo)]
@@ -290,11 +289,12 @@
                               (doto table-config
                                 (.setBlockCache block-cache)
                                 (.setCacheIndexAndFilterBlocks true)
-                                (.setPinL0FilterAndIndexBlocksInCache true)))
+                                (.setCacheIndexAndFilterBlocksWithHighPriority true)))
 
                           _ (when prefix-len
                               (.useFixedLengthPrefixExtractor cfo (int prefix-len))
                               (.setFilterPolicy table-config (BloomFilter.))
+                              (.setWholeKeyFiltering table-config false)
                               (.setOptimizeFiltersForMemory table-config true)
                               (.setMemtablePrefixBloomSizeRatio cfo 0.05))
 
