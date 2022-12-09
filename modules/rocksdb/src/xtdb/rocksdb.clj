@@ -9,7 +9,8 @@
             [xtdb.checkpoint :as cp]
             [xtdb.kv.index-store :as kvi]
             [xtdb.codec :as c])
-  (:import java.util.Map java.util.HashMap
+  (:import java.util.Map
+           java.util.HashMap
            java.util.function.Function
            (java.io Closeable File)
            (java.nio.file Files Path)
@@ -17,9 +18,9 @@
            (org.rocksdb BlockBasedTableConfig Checkpoint CompressionType FlushOptions LRUCache
                         DBOptions Options ReadOptions RocksDB RocksIterator
                         WriteBatchWithIndex WriteBatch WriteOptions Statistics StatsLevel
-                        ColumnFamilyOptions ColumnFamilyDescriptor ColumnFamilyHandle BloomFilter CompactionPriority)
-           (java.nio ByteBuffer)
-           (org.agrona DirectBuffer)))
+                        ColumnFamilyOptions ColumnFamilyDescriptor ColumnFamilyHandle BloomFilter)
+           (org.agrona DirectBuffer)
+           (xtdb.kv KvSnapshotPrefixSupport)))
 
 (defprotocol CfId
   (->cf-id [this]))
@@ -76,7 +77,11 @@
     (doseq [^RocksIterator i (.values is)]
       (.close i))))
 
-(defrecord RocksKvTxSnapshot [^RocksDB db, ->column-family-handle, ^ReadOptions read-options, snapshot, ^WriteBatchWithIndex wb]
+(defrecord RocksKvTxSnapshot [^RocksDB db, ->column-family-handle,
+                              ^ReadOptions read-options,
+                              ^ReadOptions prefix-read-options,
+                              snapshot,
+                              ^WriteBatchWithIndex wb]
   kv/KvSnapshot
   (new-iterator [_]
     (let [k->i (reify Function
@@ -89,12 +94,24 @@
     (some-> (.getFromBatchAndDB wb db ^ColumnFamilyHandle (->column-family-handle (->cf-id k)) read-options (mem/->on-heap k))
             (mem/as-buffer)))
 
+  KvSnapshotPrefixSupport
+  (newPrefixSeekOptimisedIterator [_]
+    (let [k->i (reify Function
+                 (apply [_ k]
+                   (let [cfh (->column-family-handle k)]
+                     (.newIteratorWithBase wb cfh (.newIterator db cfh prefix-read-options) prefix-read-options))))]
+      (->RocksKvIterator nil (HashMap.) k->i)))
+
   Closeable
   (close [_]
     (.close read-options)
+    (.close prefix-read-options)
     (.releaseSnapshot db snapshot)))
 
-(defrecord RocksKvSnapshot [^RocksDB db, ->column-family-handle, ^ReadOptions read-options, snapshot]
+(defrecord RocksKvSnapshot [^RocksDB db, ->column-family-handle,
+                            ^ReadOptions read-options,
+                            ^ReadOptions prefix-read-options,
+                            snapshot]
   kv/KvSnapshot
   (new-iterator [_]
     (let [k->i (reify Function
@@ -106,9 +123,17 @@
     (some-> (.get db ^ColumnFamilyHandle (->column-family-handle (->cf-id k)) read-options (mem/->on-heap k))
             (mem/as-buffer)))
 
+  KvSnapshotPrefixSupport
+  (newPrefixSeekOptimisedIterator [_]
+    (let [k->i (reify Function
+                 (apply [_ k]
+                   (.newIterator db (->column-family-handle k) read-options)))]
+      (->RocksKvIterator nil (HashMap.) k->i)))
+
   Closeable
   (close [_]
     (.close read-options)
+    (.close prefix-read-options)
     (.releaseSnapshot db snapshot)))
 
 (defrecord RocksKvTx [^RocksDB db, ->column-family-handle, ^WriteOptions write-options, ^WriteBatchWithIndex wb]
@@ -117,6 +142,8 @@
     (let [snapshot (.getSnapshot db)]
       (->RocksKvTxSnapshot db
                            ->column-family-handle
+                           (doto (ReadOptions.)
+                             (.setSnapshot snapshot))
                            (doto (ReadOptions.)
                              (.setPrefixSameAsStart true)
                              (.setSnapshot snapshot))
@@ -179,6 +206,8 @@
     (let [snapshot (.getSnapshot db)]
       (->RocksKvSnapshot db
                          ->column-family-handle
+                         (doto (ReadOptions.)
+                           (.setSnapshot snapshot))
                          (doto (ReadOptions.)
                            (.setPrefixSameAsStart true)
                            (.setSnapshot snapshot))
