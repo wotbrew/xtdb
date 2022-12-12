@@ -339,7 +339,7 @@
                (cond-> metrics (.setStatistics stats))
                (.setCreateIfMissing true)
                (.setCreateMissingColumnFamilies true)
-               (.setMaxBackgroundJobs (max 2 (dec (-> (Runtime/getRuntime) .availableProcessors)))))
+               (cond-> (nil? db-options) (.setMaxBackgroundJobs (max 2 (dec (.availableProcessors (Runtime/getRuntime)))))))
 
         db (try
              (RocksDB/open opts (-> (Files/createDirectories db-dir (make-array FileAttribute 0))
