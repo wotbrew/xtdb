@@ -18,7 +18,7 @@
            (org.rocksdb BlockBasedTableConfig Checkpoint CompressionType FlushOptions LRUCache
                         DBOptions Options ReadOptions RocksDB RocksIterator
                         WriteBatchWithIndex WriteBatch WriteOptions Statistics StatsLevel
-                        ColumnFamilyOptions ColumnFamilyDescriptor ColumnFamilyHandle BloomFilter)
+                        ColumnFamilyOptions ColumnFamilyDescriptor ColumnFamilyHandle BloomFilter WriteBufferManager)
            (org.agrona DirectBuffer)
            (xtdb.kv KvSnapshotPrefixSupport)))
 
@@ -261,11 +261,21 @@
 
 (def ^:private cp-format {:index-version c/index-version, ::version "7"})
 
+(defonce ^:private ^:redef global-buffers nil)
+
+(defn- init-buffers []
+  (let [size-mb (long (or (some-> (System/getenv "XTDB_ROCKSDB_MEMORY_MB") parse-long) 512))
+        size-bytes (* 1024 1024 size-mb)
+        cache (LRUCache. size-bytes)
+        ideal-memtable-size (* 192 1024 1024)
+        wbm (WriteBufferManager. (min ideal-memtable-size (* 0.5 size-bytes)) cache true)]
+    {:write-buffer-manager wbm
+     :block-cache cache}))
+
 (defn ->lru-block-cache {::sys/args {:cache-size {:doc "Cache size"
-                                                  :default (* 256 1024 1024)
                                                   :spec ::sys/nat-int}}}
   [{:keys [cache-size]}]
-  (LRUCache. cache-size))
+  (when cache-size (LRUCache. cache-size)))
 
 (defn ->kv-store {::sys/deps {:metrics (fn [_])
                               :checkpointer (fn [_])
@@ -297,6 +307,10 @@
   (let [default-cfo (doto (ColumnFamilyOptions.)
                       (.setCompressionType CompressionType/LZ4_COMPRESSION)
                       (.setBottommostCompressionType CompressionType/ZSTD_COMPRESSION))
+
+        block-cache-provided (some? block-cache)
+        ;; initialise global memory pool if block cache not set explicitly
+        block-cache (or block-cache (:block-cache (alter-var-root #'global-buffers (fn [buffers] (or buffers (init-buffers))))))
 
         _ (when block-cache
             (.setTableFormatConfig default-cfo (doto (BlockBasedTableConfig.)
@@ -338,6 +352,7 @@
                (cond-> metrics (.setStatistics stats))
                (.setCreateIfMissing true)
                (.setCreateMissingColumnFamilies true)
+               (cond-> (not block-cache-provided) (.setWriteBufferManager ^WriteBufferManager (:write-buffer-manager global-buffers)))
                (cond-> (nil? db-options) (.setMaxBackgroundJobs (max 2 (dec (.availableProcessors (Runtime/getRuntime)))))))
 
         db (try
