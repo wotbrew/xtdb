@@ -324,7 +324,6 @@
                               (.useFixedLengthPrefixExtractor cfo (int prefix-len))
                               (.setFilterPolicy table-config (BloomFilter.))
                               (.setWholeKeyFiltering table-config false)
-                              (.setOptimizeFiltersForMemory table-config true)
                               (.setMemtablePrefixBloomSizeRatio cfo 0.05))
 
                           _ (.setTableFormatConfig cfo table-config)
