@@ -471,14 +471,19 @@
 
 (defn ->tx-ingester {::sys/args {:batch-preferred-doc-count
                                  {:default 1024
-                                  :spec ::sys/pos-int}}
+                                  :spec ::sys/pos-int}
+                                 :deterministic-writes
+                                 {:default false
+                                  :doc "Disables features that may introduce non-deterministic writes such
+                                  as the timed flushes of statistics to the index."
+                                  :spec ::sys/boolean}}
                      ::sys/deps {:tx-indexer :xtdb/tx-indexer
                                  :index-store :xtdb/index-store
                                  :document-store :xtdb/document-store
                                  :tx-log :xtdb/tx-log
                                  :bus :xtdb/bus
                                  :secondary-indices :xtdb/secondary-indices}}
-  [{:keys [tx-log tx-indexer document-store bus index-store secondary-indices batch-preferred-doc-count]}]
+  [{:keys [tx-log tx-indexer document-store bus index-store secondary-indices batch-preferred-doc-count deterministic-writes]}]
   (log/info "Started tx-ingester")
 
   (let [!error (atom nil)
@@ -591,8 +596,13 @@
                 buf
                 (flush-stats buf)))
 
+            stats-scheduled-fn
+            (if deterministic-writes
+              (constantly nil)
+              #(send stats-agent flush))
+
             stats-scheduled-fut
-            (.scheduleAtFixedRate housekeeping-executor ^Runnable (fn [] (send stats-agent flush-stats)) 0 stats-buffer-flush-ms TimeUnit/MILLISECONDS)
+            (.scheduleAtFixedRate housekeeping-executor ^Runnable stats-scheduled-fn 0 stats-buffer-flush-ms TimeUnit/MILLISECONDS)
 
             ;; === subscription ===
 
@@ -619,8 +629,7 @@
                                               (do
                                                 (db/commit in-flight-tx tx)
                                                 (doto stats-agent
-                                                  (send buffer-docs docs)
-                                                  (send buffer-docs indexed-docs)
+                                                  (send (fn [buf] (-> buf (buffer-docs docs) (buffer-docs indexed-docs))))
                                                   (send flush-stats-if-enough-docs)))
                                               (db/abort in-flight-tx tx))))
 
