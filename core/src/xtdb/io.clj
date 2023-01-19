@@ -347,3 +347,9 @@
    (->> m
         (into {} (map (fn [v]
                         (MapEntry/create (key v) (f (val v)))))))))
+
+;; hotfix for issue 1888
+(defn tx-log-fwd-compat-patch [v]
+  (if (map? v)
+    (:xtdb.tx.event/tx-events v)
+    v))

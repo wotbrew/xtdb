@@ -133,7 +133,7 @@
     (assert (= 1 (count (.partitions ^TopicDescription (get name->description tx-topic)))))))
 
 (defn- tx-record->tx-log-entry [^ConsumerRecord record]
-  {:xtdb.tx.event/tx-events (.value record)
+  {:xtdb.tx.event/tx-events (xio/tx-log-fwd-compat-patch (.value record))
    ::xt/tx-id (.offset record)
    ::xt/tx-time (Date. (.timestamp record))})
 

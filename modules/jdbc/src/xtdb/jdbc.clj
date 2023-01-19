@@ -154,7 +154,7 @@
                          (map (fn [y]
                                 {::xt/tx-id (long (:event_offset y))
                                  ::xt/tx-time (-> (:tx_time y) (->date dialect))
-                                 ::txe/tx-events (-> (:v y) (<-blob dialect))}))))))
+                                 ::txe/tx-events (xio/tx-log-fwd-compat-patch (-> (:v y) (<-blob dialect)))}))))))
 
   (subscribe [this after-tx-id f]
     (tx-sub/handle-polling-subscription this after-tx-id {:poll-sleep-duration (Duration/ofMillis 100)} f))

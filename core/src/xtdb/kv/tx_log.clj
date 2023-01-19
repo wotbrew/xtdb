@@ -63,7 +63,7 @@
               (lazy-seq
                (when (some-> k (tx-event-key?))
                  (cons (assoc (decode-tx-event-key-from k)
-                              :xtdb.tx.event/tx-events (mem/<-nippy-buffer (kv/value iterator)))
+                              :xtdb.tx.event/tx-events (xio/tx-log-fwd-compat-patch (mem/<-nippy-buffer (kv/value iterator))))
                        (tx-log (kv/next iterator))))))]
       (let [after-tx-id (or (some-> after-tx-id (+ 1)) 0)]
         (->> (tx-log (kv/seek iterator (encode-tx-event-key-to nil {::xt/tx-id after-tx-id})))
