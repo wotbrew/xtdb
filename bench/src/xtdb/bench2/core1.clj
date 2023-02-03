@@ -15,6 +15,9 @@
             [xtdb.memory :as mem]
             [clojure.spec.alpha :as s])
   (:import (java.time Duration)
+           (java.time Instant Duration Clock)
+           (java.util Random)
+           (java.util.concurrent ConcurrentHashMap)
            (java.util.concurrent.atomic AtomicLong)
            (java.io Closeable File DataOutputStream DataInputStream)
            (java.util Date HashMap ArrayList)
@@ -134,14 +137,24 @@
         compute-lag-nanos
         (fn []
           (or
-            (when-some [[{::xt/keys [tx-id]} ms] @last-submitted]
-              (when-some [{completed-tx-id ::xt/tx-id
-                           completed-tx-time ::xt/tx-time} @last-completed]
-                (when (< completed-tx-id tx-id)
-                  (* (long 1e6) (- ms (inst-ms completed-tx-time))))))
-            0))]
+           (when-some [[{::xt/keys [tx-id]} ms] @last-submitted]
+             (when-some [{completed-tx-id ::xt/tx-id
+                          completed-tx-time ::xt/tx-time} @last-completed]
+               (when (< completed-tx-id tx-id)
+                 (* (long 1e6) (- ms (inst-ms completed-tx-time))))))
+           0))
 
-    (fn-gauge "node.tx.lag" (comp #(/ % 1e9) compute-lag-nanos) {:unit "seconds"})
+        compute-lag-abs
+        (fn []
+          (or
+           (when-some [[{::xt/keys [tx-id]} _] @last-submitted]
+             (when-some [{completed-tx-id ::xt/tx-id} @last-completed]
+               (- tx-id completed-tx-id)))
+           0))]
+
+
+    (fn-gauge "node.tx.lag seconds" (comp #(/ % 1e9) compute-lag-nanos) {:unit "seconds"})
+    (fn-gauge "node.tx.lag tx-id" compute-lag-abs #_{:unit "seconds"})
     (fn-gauge "node.kv.keys" #(:xtdb.kv/estimate-num-keys (xt/status node) 0) {:unit "count"})
     (fn-gauge "node.kv.size" #(:xtdb.kv/size (xt/status node) 0) {:unit "bytes"})
 
@@ -273,16 +286,16 @@
 
 (def ^:dynamic *rocks-stats-cubby-hole*)
 
-(defn undata-node-opts [{:keys [index, log, docs]}]
+(defn undata-node-opts [{:keys [index, log, docs, node-dir]}]
   (let [rocks-kv (fn [k] {:xtdb/module 'xtdb.rocksdb/->kv-store,
                           :metrics (fn [_]
                                      (fn [_db stats]
                                        (when (thread-bound? #'*rocks-stats-cubby-hole*)
                                          (set! *rocks-stats-cubby-hole* (assoc *rocks-stats-cubby-hole* k stats)))))
-                          :db-dir (xio/create-tmpdir "kv")
+                          :db-dir (or (io/file node-dir (name k)) (xio/create-tmpdir "kv"))
                           :db-dir-suffix "kv"})
         lmdb-kv (fn [] {:xtdb/module 'xtdb.lmdb/->kv-store,
-                        :db-dir (xio/create-tmpdir "kv")
+                        :db-dir (or node-dir (xio/create-tmpdir "kv"))
                         :db-dir-suffix "kv"})
         undata (fn [k t]
                  (case t
@@ -680,20 +693,45 @@
   (Thread/sleep 1000)
   {:index (index-checksum node)})
 
+(defn delete-directory-recursive
+  "Recursively delete a directory."
+  [^java.io.File file]
+  (when (.isDirectory file)
+    (run! delete-directory-recursive (.listFiles file)))
+  (io/delete-file file))
+
+(defn- ->worker [node]
+  (let [clock (Clock/systemUTC)
+        domain-state (ConcurrentHashMap.)
+        custom-state (ConcurrentHashMap.)
+        root-random (Random. 112)
+        reports (atom [])
+        worker (b2/->Worker node root-random domain-state custom-state clock reports)]
+    worker))
+
 (comment
   ;; ======
   ;; Running in process
   ;; ======
 
+  (def run-duration "PT5S")
+  (def run-duration "PT10S")
   (def run-duration "PT30S")
   (def run-duration "PT2M")
+  (def run-duration "PT5M")
   (def run-duration "PT10M")
+
+  (def node-dir (io/file "dev/dev-node-0.1"))
+  (def node-opts {:index :rocks, :log :rocks, :docs :rocks, :node-dir node-dir})
+  (delete-directory-recursive node-dir)
 
   (def report1-rocks
     (run-benchmark
-      {:node-opts {:index :rocks, :log :rocks, :docs :rocks}
-       :benchmark-type :auctionmark
-       :benchmark-opts {:duration run-duration}}))
+     {:node-opts {:index :rocks, :log :rocks, :docs :rocks, :node-dir node-dir}
+      :benchmark-type :auctionmark
+      :benchmark-opts {:duration run-duration :sync true
+                       :scale-factor 0.1 :threads 8}}))
+
 
   (require 'xtdb.bench2.report)
   (xtdb.bench2.report/show-html-report
