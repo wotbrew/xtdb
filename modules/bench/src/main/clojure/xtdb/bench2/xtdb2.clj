@@ -164,7 +164,7 @@
         (case benchmark-type
           :auctionmark
           ((requiring-resolve 'xtdb.bench2.auctionmark/benchmark) benchmark-opts)
-          #_#_:tpch
+          :tpch
           ((requiring-resolve 'xtdb.bench2.tpch/benchmark) benchmark-opts)
           #_#_:trace (trace benchmark-opts))
         benchmark-fn (b/compile-benchmark
