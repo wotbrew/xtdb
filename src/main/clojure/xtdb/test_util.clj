@@ -178,28 +178,31 @@
 (defn query-ra
   ([query] (query-ra query {}))
   ([query {:keys [node params preserve-blocks? with-col-types?] :as query-opts}]
-   (let [^IIndexer indexer (util/component node :xtdb/indexer)
-         query-opts (cond-> query-opts
-                      node (-> (update :basis api/after-latest-submitted-tx node)
-                               (doto (-> :basis :after-tx (then-await-tx* node)))))]
+   (binding [*allocator* (if (bound? #'*allocator*)
+                           *allocator*
+                           (util/component node :xtdb/allocator))]
+     (let [^IIndexer indexer (util/component node :xtdb/indexer)
+           query-opts (cond-> query-opts
+                              node (-> (update :basis api/after-latest-submitted-tx node)
+                                       (doto (-> :basis :after-tx (then-await-tx* node)))))]
 
-     (with-open [^IIndirectRelation
-                 params-rel (if params
-                              (vw/open-params *allocator* params)
-                              vw/empty-params)]
-       (let [^PreparedQuery pq (if node
-                                 (let [^IRaQuerySource ra-src (util/component node ::op/ra-query-source)]
-                                   (.prepareRaQuery ra-src query))
-                                 (op/prepare-ra query))
-             bq (.bind pq indexer
-                       (-> (select-keys query-opts [:basis :table-args :default-tz :default-all-app-time?])
-                           (assoc :params params-rel)))]
-         (with-open [res (.openCursor bq)]
-           (let [rows (-> (<-cursor res)
-                          (cond->> (not preserve-blocks?) (into [] cat)))]
-             (if with-col-types?
-               {:res rows, :col-types (.columnTypes bq)}
-               rows))))))))
+       (with-open [^IIndirectRelation
+                   params-rel (if params
+                                (vw/open-params *allocator* params)
+                                vw/empty-params)]
+         (let [^PreparedQuery pq (if node
+                                   (let [^IRaQuerySource ra-src (util/component node ::op/ra-query-source)]
+                                     (.prepareRaQuery ra-src query))
+                                   (op/prepare-ra query))
+               bq (.bind pq indexer
+                         (-> (select-keys query-opts [:basis :table-args :default-tz :default-all-app-time?])
+                             (assoc :params params-rel)))]
+           (with-open [res (.openCursor bq)]
+             (let [rows (-> (<-cursor res)
+                            (cond->> (not preserve-blocks?) (into [] cat)))]
+               (if with-col-types?
+                 {:res rows, :col-types (.columnTypes bq)}
+                 rows)))))))))
 
 (t/deftest round-trip-cursor
   (with-allocator
