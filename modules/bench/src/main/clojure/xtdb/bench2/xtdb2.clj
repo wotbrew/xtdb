@@ -6,7 +6,8 @@
             [xtdb.datalog :as xt]
             [xtdb.node :as node]
             [xtdb.test-util :as tu])
-  (:import (io.micrometer.core.instrument MeterRegistry Timer)
+  (:import (clojure.lang ILookup)
+           (io.micrometer.core.instrument MeterRegistry Timer)
            (java.io Closeable File)
            (java.nio.file Path)
            (java.time Clock Duration)
@@ -111,9 +112,14 @@
     (fn-gauge "node.tx.lag tx-id" compute-lag-abs )
 
     (reify
+      ILookup
+      (valAt [_ k] (get node k))
+      (valAt [_ k not-found] (get node not-found))
+
       xt.impl/PNode
       (open-datalog& [_ query args] (xt.impl/open-datalog& node query args))
       (open-sql& [_ query query-opts] (xt.impl/open-sql& node query query-opts))
+      (latest-submitted-tx [_] (xt.impl/latest-submitted-tx node))
 
       xt.impl/PStatus
       (status [_]
