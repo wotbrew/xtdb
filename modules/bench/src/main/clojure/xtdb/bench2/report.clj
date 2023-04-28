@@ -233,5 +233,7 @@
                          metric metrics]
                      (assoc metric :vs-label (str label))))}))
 
-(defn stage-only [report stage]
-  (update report :reports (partial filterv #(= stage (:stage %)))))
+(defn filter-stages [report pred]
+  (update report :stages (partial filterv #(pred (:stage %)))))
+
+(defn stage-only [report stage] (filter-stages report #{stage}))
