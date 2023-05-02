@@ -1,4 +1,5 @@
-(ns xtdb.datasets.tpch.datalog)
+(ns xtdb.datasets.tpch.datalog
+  (:require [xtdb.node :as node]))
 
 (defn- with-in-args [q in-args]
   (-> q (vary-meta assoc ::in-args in-args)))
@@ -424,3 +425,62 @@
 (def queries
   [#'q1 #'q2 #'q3 #'q4 #'q5 #'q6 #'q7 #'q8 #'q9 #'q10 #'q11
    #'q12 #'q13 #'q14 #'q15 #'q16 #'q17 #'q18 #'q19 #'q20 #'q21 #'q22])
+
+(comment
+
+  (do
+    (require '[xtdb.datalog :as d])
+    (require '[xtdb.node :as node])
+    (require '[xtdb.datasets.tpch :as tpch])
+    (require '[xtdb.util :as util])
+    (require '[xtdb.api.impl :as api-impl])
+
+    (def sf 0.05)
+
+    (def n
+      (do (when (bound? #'n) (.close ^java.io.Closeable n))
+          (vary-meta (node/start-node {}) assoc ::sf sf)))
+
+    (do (println "ingesting" sf)
+        (tpch/submit-docs! n sf)
+        (println "syncing")
+        @(.awaitTxAsync ^xtdb.ingester.Ingester (util/component n :xtdb/ingester)
+                        (api-impl/latest-submitted-tx n)
+                        (java.time.Duration/ofMinutes 2))
+        (println "done"))
+
+    (defn nth-qvar [i] {:post [(var? %)]} (nth queries (dec i) 0))
+
+    (defn t [i]
+      (let [v (nth-qvar i)]
+        (println "testing" v "sf" (::sf (meta n)))
+        (time (count (apply d/q n @v (::in-args (meta @v)))))))
+
+    )
+
+  (.close ^java.io.Closeable n)
+
+  (t 1)
+  (t 2)
+  (t 3)
+  (t 4)
+  (t 5)
+  (t 6)
+  (t 7)
+  (t 8)
+  (t 9)
+  (t 10)
+  (t 11)
+  (t 12)
+  (t 13)
+  (t 14)
+  (t 15)
+  (t 16)
+  (t 17)
+  (t 18)
+  (t 19)
+  (t 20)
+  (t 21)
+  (t 22)
+
+  )
