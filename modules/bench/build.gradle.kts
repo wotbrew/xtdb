@@ -14,6 +14,9 @@ dependencies {
     api("org.clojure", "data.csv", "1.0.1")
     api("ch.qos.logback", "logback-classic", "1.2.10")
 
+    // for AWS profiles (managing datasets)
+    api("software.amazon.awssdk", "sts", "2.16.76")
+
     // bench2
     api("io.micrometer", "micrometer-core", "1.9.5")
     api("com.github.oshi", "oshi-core", "6.3.0")
