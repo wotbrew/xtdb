@@ -37,26 +37,51 @@
     a
     (keyword (munge (str a)))))
 
-(defn doc->xtdb2-put [doc]
-  (let [id (:_id doc)
-        attributes (dissoc doc :_id)]
-    [:put :xt_docs (assoc (update-keys attributes rewrite-attribute) :xt/id id)]))
+(defn rewrite-value [v]
+  (if (set? v) (vec v) v))
 
-(defn where->xtdb-where [where]
+(defn xtdb2-doc [watdiv-doc]
+  (let [id (:_id watdiv-doc)
+        doc' (dissoc watdiv-doc :_id)]
+    (into {:xt/id id} (map (fn [[a v]] [(rewrite-attribute a) (rewrite-value v)])) doc')))
+
+(defn xtdb2-put [watdiv-doc] [:put :xt_docs (xtdb2-doc watdiv-doc)])
+
+(defn doc-attribute-cardinality [doc]
+  (update-vals doc #(if (coll? %) :many :one)))
+
+(defn cardinality-schema [docs]
+  (reduce (partial merge-with (fn [a b] (if (= a b) a :mixed))) {} (map doc-attribute-cardinality docs)))
+
+(def memo-gensym (memoize (fn [& p] (gensym (apply str p)))))
+
+(defn value-bindings [v-sym card]
+  (case card
+    :one {:match v-sym}
+    :many {:match [v-sym '...]}
+    :mixed
+    (let [match-sym (memo-gensym v-sym 'mixed-card-binding)]
+      {:match match-sym
+       :project [match-sym [v-sym '...]]})))
+
+(defn where->xtdb-where [where card-schema]
   (assert (every? #(and (vector? %) (= 3 (count %))) where) "only triples supported")
   (let [e-vars (mapv #(nth % 0) where)
         e-var-indexes (zipmap e-vars (range))]
     (->> where
          (group-by #(nth % 0))
          (sort-by (comp e-var-indexes key))
-         (mapv (fn [[e-var triples]]
-                 (list '$ :xt_docs (into {e-var :xt/id} (map (fn [[_ a v]] [v a])) triples)))))))
+         (mapcat (fn [[e-var triples]]
+                   (let [v-binds (mapv (fn [[_ a v]] (value-bindings v (card-schema (rewrite-attribute a)))) triples)]
+                     (->> (keep :project v-binds)
+                          (into [(list '$ :xt_docs (into {:xt/id e-var} (map (fn [{:keys [match]} [_ a]] [(rewrite-attribute a) match]) v-binds triples)))])))))
+         vec)))
 
-(defn query->xtdb2-datalog [query]
-  (update query :where where->xtdb-where))
+(defn query->xtdb2-datalog [query card-schema]
+  (update query :where where->xtdb-where card-schema))
 
 (defn ingest [node doc-file]
-  (let [xf (comp (map doc->xtdb2-put)
+  (let [xf (comp (map xtdb2-put)
                  (partition-all 512))]
     (->> (eduction xf (edn-reducable doc-file))
          (run! #(d/submit-tx node %)))))
@@ -79,22 +104,26 @@
   (sample-edn 5 dev-query-file)
 
   ;; sample puts
-  (map doc->xtdb2-put (sample-edn 5 dev-docs-file))
+  (map xtdb2-put (sample-edn 5 dev-docs-file))
 
   ;; sample queries
   (map query->xtdb2-datalog (sample-edn 5 dev-query-file))
 
-  (def all-docs (vec (edn-reducable dev-docs-file)))
+  (def all-docs (mapv xtdb2-doc (edn-reducable dev-docs-file)))
   (count all-docs)
+  (def cs (cardinality-schema all-docs))
 
-  (def all-queries (vec (edn-reducable dev-query-file)))
+  (def all-queries (mapv #(query->xtdb2-datalog % cs) (edn-reducable dev-query-file)))
   (count all-queries)
-  (count (map query->xtdb2-datalog all-queries))
 
   (def n (node/start-node {}))
+  (.close n)
+
   (time (ingest n dev-docs-file))
 
   ;; docs have sets in them, causes a meta crash.
-  (count (d/q n (query->xtdb2-datalog (first all-queries))))
+  (count (d/q n (first all-queries)))
+
+  (cardinality-schema (map xtdb2-doc all-docs))
 
   )
