@@ -99,7 +99,6 @@
             "006 - Other"))
 
         metric-groups (group-by group-fn metrics)]
-
     metric-groups))
 
 (def transaction-prefix "bench.transaction.")

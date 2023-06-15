@@ -29,6 +29,8 @@
 
 (defn increment [worker domain] (domain (.getAndIncrement (counter worker domain))))
 
+(defn set-domain [worker domain cnt] (.getAndAdd (counter worker domain) cnt))
+
 (defn- nat-or-nil [n] (when (nat-int? n) n))
 
 (defn sample-gaussian [worker domain]
