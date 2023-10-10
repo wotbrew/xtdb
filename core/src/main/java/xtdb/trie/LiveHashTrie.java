@@ -1,19 +1,28 @@
 package xtdb.trie;
 
+import com.carrotsearch.hppc.IntArrayList;
+import com.carrotsearch.hppc.sorting.IndirectSort;
+import org.apache.arrow.flatbuf.Int;
 import org.apache.arrow.memory.util.ArrowBufPointer;
 import xtdb.vector.IVectorReader;
 
 import java.util.Arrays;
+import java.util.function.IntBinaryOperator;
 import java.util.stream.IntStream;
 
 public record LiveHashTrie(Node rootNode, IVectorReader iidReader) implements HashTrie<LiveHashTrie.Node> {
 
     private static final int LOG_LIMIT = 64;
     private static final int PAGE_LIMIT = 1024;
+    private static final int PAGE_BYTE_LIMIT = 512 * 1024;
     private static final int MAX_LEVEL = 64;
 
     public sealed interface Node extends HashTrie.Node<Node> {
-        Node add(LiveHashTrie trie, int idx);
+        default Node add(LiveHashTrie trie, int idx) {
+            return add(trie, idx, 0);
+        }
+
+        Node add(LiveHashTrie trie, int idx, int size);
 
         Node compactLogs(LiveHashTrie trie);
     }
@@ -22,6 +31,7 @@ public record LiveHashTrie(Node rootNode, IVectorReader iidReader) implements Ha
         private final IVectorReader iidReader;
         private int logLimit = LOG_LIMIT;
         private int pageLimit = PAGE_LIMIT;
+        private int pageByteLimit = PAGE_BYTE_LIMIT;
         private byte[] rootPath = new byte[0];
 
         private Builder(IVectorReader iidReader) {
@@ -36,12 +46,16 @@ public record LiveHashTrie(Node rootNode, IVectorReader iidReader) implements Ha
             this.pageLimit = pageLimit;
         }
 
+        public void setPageByteLimit(int pageByteLimit) {
+            this.pageByteLimit = pageByteLimit;
+        }
+
         public void setRootPath(byte[] path) {
             this.rootPath = path;
         }
 
         public LiveHashTrie build() {
-            return new LiveHashTrie(new Leaf(logLimit, pageLimit, rootPath), iidReader);
+            return new LiveHashTrie(new Leaf(logLimit, pageLimit, pageByteLimit, rootPath), iidReader);
         }
     }
 
@@ -54,8 +68,8 @@ public record LiveHashTrie(Node rootNode, IVectorReader iidReader) implements Ha
         return builder(iidReader).build();
     }
 
-    public LiveHashTrie add(int idx) {
-        return new LiveHashTrie(rootNode.add(this, idx), iidReader);
+    public LiveHashTrie add(int idx, int size) {
+        return new LiveHashTrie(rootNode.add(this, idx, size), iidReader);
     }
 
     @SuppressWarnings("unused")
@@ -92,10 +106,10 @@ public record LiveHashTrie(Node rootNode, IVectorReader iidReader) implements Ha
         return childPath;
     }
 
-    public record Branch(int logLimit, int pageLimit, byte[] path, Node[] children) implements Node {
+    public record Branch(int logLimit, int pageLimit, int pageByteLimit, byte[] path, Node[] children) implements Node {
 
         @Override
-        public Node add(LiveHashTrie trie, int idx) {
+        public Node add(LiveHashTrie trie, int idx, int size) {
             var bucket = trie.bucketFor(idx, path.length);
 
             var newChildren = IntStream.range(0, children.length)
@@ -103,14 +117,14 @@ public record LiveHashTrie(Node rootNode, IVectorReader iidReader) implements Ha
                         var child = children[childIdx];
                         if (bucket == childIdx) {
                             if (child == null) {
-                                child = new Leaf(logLimit, pageLimit, conjPath(path, (byte) childIdx));
+                                child = new Leaf(logLimit, pageLimit, pageByteLimit, conjPath(path, (byte) childIdx));
                             }
-                            child = child.add(trie, idx);
+                            child = child.add(trie, idx, size);
                         }
                         return child;
                     }).toArray(Node[]::new);
 
-            return new Branch(logLimit, pageLimit, path, newChildren);
+            return new Branch(logLimit, pageLimit, pageByteLimit, path, newChildren);
         }
 
         @Override
@@ -120,18 +134,29 @@ public record LiveHashTrie(Node rootNode, IVectorReader iidReader) implements Ha
                             .map(child -> child == null ? null : child.compactLogs(trie))
                             .toArray(Node[]::new);
 
-            return new Branch(logLimit, pageLimit, path, children);
+            return new Branch(logLimit, pageLimit, pageByteLimit, path, children);
         }
     }
 
-    public record Leaf(int logLimit, int pageLimit, byte[] path, int[] data, int[] log, int logCount) implements Node {
+    public record Leaf(int logLimit, int pageLimit, int pageByteLimit, byte[] path, int[] data, int[] dataSizes, int[] log, int[] logSizes, int logCount) implements Node {
 
-        Leaf(int logLimit, int pageLimit, byte[] path) {
-            this(logLimit, pageLimit, path, new int[0]);
+        static int[] permutation(LiveHashTrie trie, int[] positions, int len) {
+            return IndirectSort.mergesort(0, len, (l, r) -> trie.compare(positions[l], positions[r]));
         }
 
-        private Leaf(int logLimit, int pageLimit, byte[] path, int[] data) {
-            this(logLimit, pageLimit, path, data, new int[logLimit], 0);
+        static void permute(int[] permutation, int[] in, int[] out) {
+            for (int i = 0; i < permutation.length; i++) {
+                var p = permutation[i];
+                out[i] = in[p];
+            }
+        }
+
+        Leaf(int logLimit, int pageLimit, int pageByteLimit, byte[] path) {
+            this(logLimit, pageLimit, pageByteLimit, path, new int[0], new int[0]);
+        }
+
+        private Leaf(int logLimit, int pageLimit, int pageByteLimit, byte[] path, int[] data, int[] dataSizes) {
+            this(logLimit, pageLimit, pageByteLimit, path, data, dataSizes, new int[logLimit], new int[logLimit], 0);
         }
 
         @Override
@@ -139,93 +164,80 @@ public record LiveHashTrie(Node rootNode, IVectorReader iidReader) implements Ha
             return null;
         }
 
-        private int[] mergeSort(LiveHashTrie trie, int[] data, int[] log, int logCount) {
-            int dataCount = data.length;
+        private Branch partitionLeaf(LiveHashTrie trie, int[] newData, int[] newSizes) {
+            var buckets = new IntArrayList[LEVEL_WIDTH];
+            var nodes = new Node[LEVEL_WIDTH];
 
-            var res = IntStream.builder();
-            var dataIdx = 0;
-            var logIdx = 0;
-
-            while (true) {
-                if (dataIdx == dataCount) {
-                    IntStream.range(logIdx, logCount).forEach(idx -> res.add(log[idx]));
-                    break;
+            for (int i = 0; i < newData.length; i++) {
+                var dataPos = newData[i];
+                var bucket = trie.bucketFor(dataPos, path.length);
+                var bucketList = buckets[bucket];
+                if (bucketList == null) {
+                    bucketList = new IntArrayList();
+                    buckets[bucket] = bucketList;
                 }
-
-                if (logIdx == logCount) {
-                    IntStream.range(dataIdx, dataCount).forEach(idx -> res.add(data[idx]));
-                    break;
-                }
-
-                var dataKey = data[dataIdx];
-                var logKey = log[logIdx];
-
-                if (trie.compare(dataKey, logKey) < 0) {
-                    res.add(dataKey);
-                    dataIdx++;
-                } else {
-                    res.add(logKey);
-                    logIdx++;
-                }
+                bucketList.add(i);
             }
 
-            return res.build().toArray();
-        }
-
-        private int[] sortLog(LiveHashTrie trie, int[] log, int logCount) {
-            // this is a little convoluted, but AFAICT this is the only way to guarantee a 'stable' sort,
-            // (`Stream.sorted()` doesn't guarantee it), which is required for the log (to preserve insertion order)
-            var boxedArray = Arrays.stream(log).limit(logCount).boxed().toArray(Integer[]::new);
-            Arrays.sort(boxedArray, trie::compare);
-            return Arrays.stream(boxedArray).mapToInt(i -> i).toArray();
-        }
-
-        private int[][] idxBuckets(LiveHashTrie trie, int[] idxs, byte[] path) {
-            var entryGroups = new IntStream.Builder[LEVEL_WIDTH];
-            for (int i : idxs) {
-                int groupIdx = trie.bucketFor(i, path.length);
-                var group = entryGroups[groupIdx];
-                if (group == null) {
-                    entryGroups[groupIdx] = group = IntStream.builder();
+            for (int bucket = 0; bucket < LEVEL_WIDTH; bucket++) {
+                var bucketList = buckets[bucket];
+                if (bucketList != null) {
+                    var bucketData = new int[bucketList.size()];
+                    var bucketSizes = new int[bucketList.size()];
+                    for (int i = 0; i < bucketList.size(); i++) {
+                        var p = bucketList.get(i);
+                        bucketData[i] = newData[p];
+                        bucketSizes[i] = newSizes[p];
+                    }
+                    nodes[bucket] = new Leaf(logLimit, pageLimit, pageByteLimit, conjPath(path, (byte) bucket), bucketData, bucketSizes);
                 }
-
-                group.add(i);
             }
-
-            return Arrays.stream(entryGroups).map(b -> b == null ? null : b.build().toArray()).toArray(int[][]::new);
+            return new Branch(logLimit, pageLimit, pageByteLimit, path, nodes);
         }
 
         @Override
         public Node compactLogs(LiveHashTrie trie) {
             if (logCount == 0) return this;
 
-            var data = mergeSort(trie, this.data, sortLog(trie, log, logCount), logCount);
-            var log = new int[this.logLimit];
-            var logCount = 0;
+            var newLength = this.data.length + logCount;
+            var concatenatedData = new int[newLength];
+            var concatenatedSizes = new int[newLength];
 
-            if (data.length > this.pageLimit && path.length < MAX_LEVEL) {
-                var childBuckets = idxBuckets(trie, data, path);
+            System.arraycopy(this.data, 0, concatenatedData, 0, this.data.length);
+            System.arraycopy(this.log, 0, concatenatedData, this.data.length, logCount);
+            System.arraycopy(this.dataSizes, 0, concatenatedSizes, 0, this.data.length);
+            System.arraycopy(this.logSizes, 0, concatenatedSizes, this.data.length, logCount);
 
-                var childNodes = IntStream.range(0, childBuckets.length)
-                        .mapToObj(childIdx -> {
-                            var childBucket = childBuckets[childIdx];
-                            return childBucket == null ? null : new Leaf(logLimit, pageLimit, conjPath(path, (byte) childIdx), childBucket);
-                        }).toArray(Node[]::new);
+            var permutation = permutation(trie, concatenatedData, newLength);
+            var newData = new int[newLength];
+            var newSizes = new int[newLength];
+            permute(permutation, concatenatedData, newData);
+            permute(permutation, concatenatedSizes, newSizes);
 
-                return new Branch(logLimit, pageLimit, path, childNodes);
+            long byteCount = 0;
+            for (int newSize : newSizes) {
+                byteCount += newSize;
+            }
+
+            var pageLimitExceeded = newData.length > this.pageLimit;
+            var byteLimitExceeded = byteCount > this.pageByteLimit;
+            var canBranch = path.length < MAX_LEVEL;
+
+            if ((pageLimitExceeded || byteLimitExceeded) && canBranch) {
+                return partitionLeaf(trie, newData, newSizes);
             } else {
-                return new Leaf(logLimit, pageLimit, path, data, log, logCount);
+                return new Leaf(logLimit, pageLimit, pageByteLimit, path, newData, newSizes, new int[this.logLimit], new int[this.logLimit], 0);
             }
         }
 
         @Override
-        public Node add(LiveHashTrie trie, int newIdx) {
-            var data = this.data;
-            var log = this.log;
-            var logCount = this.logCount;
-            log[logCount++] = newIdx;
-            var newLeaf = new Leaf(logLimit, pageLimit, path, data, log, logCount);
 
+        public Node add(LiveHashTrie trie, int newIdx, int size) {
+            var logCount = this.logCount;
+            log[logCount] = newIdx;
+            logSizes[logCount] = size;
+            logCount++;
+            var newLeaf = new Leaf(logLimit, pageLimit, pageByteLimit, path, data, dataSizes, log, logSizes, logCount);
             return logCount == this.logLimit ? newLeaf.compactLogs(trie) : newLeaf;
         }
     }
