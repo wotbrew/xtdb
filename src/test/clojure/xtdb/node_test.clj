@@ -1,6 +1,7 @@
 (ns xtdb.node-test
   (:require [clojure.test :as t :refer [deftest]]
             [xtdb.api :as xt]
+            [xtdb.node :as node]
             [xtdb.test-util :as tu]
             [xtdb.util :as util])
   (:import xtdb.types.ClojureForm))
@@ -503,3 +504,11 @@ VALUES(1, OBJECT ('foo': OBJECT('bibble': true), 'bar': OBJECT('baz': 1001)))"]]
            (xt/q tu/*node*
                  '{:find [bar]
                    :where [(match :foo [bar])]}))))
+
+(t/deftest test-calling-custom-sci-hook
+  (let [called (atom false)]
+    (with-open [node (node/start-node {:xtdb/indexer {:sci-opts {:namespaces {'foo {'bar (fn [] (reset! called true) nil)}}}}})]
+      (xt/submit-tx node [[:put-fn :foo '(fn [] (foo/bar))]])
+      (xt/submit-tx node [[:call :foo]])
+      (tu/then-await-tx node)
+      (t/is (= true @called)))))

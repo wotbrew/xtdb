@@ -221,16 +221,19 @@
   (first (reset-vals! !last-tx-fn-error nil)))
 
 (defn- ->call-indexer ^xtdb.indexer.OpIndexer [allocator, ra-src, wm-src, scan-emitter
-                                               ^IVectorReader tx-ops-rdr, {:keys [tx-key] :as tx-opts}]
+                                               ^IVectorReader tx-ops-rdr, {:keys [tx-key] :as tx-opts}, sci-opts]
   (let [call-leg (.legReader tx-ops-rdr :call)
         fn-id-rdr (.structKeyReader call-leg "fn-id")
         args-rdr (.structKeyReader call-leg "args")
 
         ;; TODO confirm/expand API that we expose to tx-fns
-        sci-ctx (sci/init {:bindings {'q (tx-fn-q allocator ra-src wm-src scan-emitter tx-opts)
-                                      'sql-q (partial tx-fn-sql allocator ra-src wm-src tx-opts)
-                                      'sleep (fn [n] (Thread/sleep n))
-                                      '*current-tx* tx-key}})]
+        sci-ctx (sci/init (merge-with
+                            (fn [a b] (if (and (map? a) (map? b)) (merge a b) b))
+                            sci-opts
+                            {:bindings {'q (tx-fn-q allocator ra-src wm-src scan-emitter tx-opts)
+                                        'sql-q (partial tx-fn-sql allocator ra-src wm-src tx-opts)
+                                        'sleep (fn [n] (Thread/sleep n))
+                                        '*current-tx* tx-key}}))]
 
     (reify OpIndexer
       (indexOp [_ tx-op-idx]
@@ -454,7 +457,8 @@
                   ^long rows-per-chunk
 
                   ^:volatile-mutable ^IWatermark shared-wm
-                  ^StampedLock wm-lock]
+                  ^StampedLock wm-lock
+                  sci-opts]
 
   IIndexer
   (indexTx [this {:keys [system-time] :as tx-key} tx-root]
@@ -495,7 +499,7 @@
                             !put-idxer (delay (->put-indexer row-counter live-idx-tx tx-ops-rdr system-time))
                             !delete-idxer (delay (->delete-indexer row-counter live-idx-tx tx-ops-rdr system-time))
                             !evict-idxer (delay (->evict-indexer row-counter live-idx-tx tx-ops-rdr))
-                            !call-idxer (delay (->call-indexer allocator ra-src wm-src scan-emitter tx-ops-rdr tx-opts))
+                            !call-idxer (delay (->call-indexer allocator ra-src wm-src scan-emitter tx-ops-rdr tx-opts sci-opts))
                             !sql-idxer (delay (->sql-indexer allocator row-counter live-idx-tx tx-ops-rdr ra-src wm-src scan-emitter tx-opts))]
                         (dotimes [tx-op-idx (.valueCount tx-ops-rdr)]
                           (when-let [more-tx-ops (case (.getLeg tx-ops-rdr tx-op-idx)
@@ -639,11 +643,12 @@
           :scan-emitter (ig/ref :xtdb.operator.scan/scan-emitter)
           :live-index (ig/ref :xtdb.indexer/live-index)
           :ra-src (ig/ref ::op/ra-query-source)
-          :rows-per-chunk 102400}
+          :rows-per-chunk 102400
+          :sci-opts {}}
          opts))
 
 (defmethod ig/init-key :xtdb/indexer
-  [_ {:keys [allocator buffer-pool metadata-mgr scan-emitter, ra-src, live-index, rows-per-chunk]}]
+  [_ {:keys [allocator buffer-pool metadata-mgr scan-emitter, ra-src, live-index, rows-per-chunk, sci-opts]}]
 
   (let [{:keys [latest-completed-tx next-chunk-idx], :or {next-chunk-idx 0}} (meta/latest-chunk-metadata metadata-mgr)]
     (util/with-close-on-catch [allocator (util/->child-allocator allocator "indexer")]
@@ -659,7 +664,8 @@
                  rows-per-chunk
 
                  nil ;; watermark
-                 (StampedLock.)))))
+                 (StampedLock.)
+                 sci-opts))))
 
 (defmethod ig/halt-key! :xtdb/indexer [_ indexer]
   (util/close indexer))
